@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""Configuration and credential helpers for corvex-delegate."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+import tomllib
+from typing import Any
+from urllib import error, parse, request
+
+
+DEFAULT_BASE_URL = "https://api.tokenfactory.corvex.cloud/v1"
+DEFAULT_API_KEY_ENV = "CORVEX_API_KEY"
+CONFIG_FIELDS = {
+    "version",
+    "base_url",
+    "model",
+    "api_key_env",
+    "credentials_file",
+    "default_complexity",
+}
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+class NoRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Never forward provider credentials to a redirect destination.
+        return None
+
+
+def open_request(req: request.Request, timeout: int):
+    return request.build_opener(NoRedirect()).open(req, timeout=timeout)
+
+
+def get_codex_home(override: Path | None = None) -> Path:
+    if override is not None:
+        return override.expanduser().resolve()
+    configured = os.environ.get("CODEX_HOME")
+    return Path(configured).expanduser().resolve() if configured else Path.home() / ".codex"
+
+
+def default_config_path(codex_home: Path | None = None) -> Path:
+    return get_codex_home(codex_home) / "corvex-delegate" / "config.toml"
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            raise ConfigError(f"invalid environment entry at {path}:{line_number}")
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not name.replace("_", "a").isalnum() or name[0].isdigit():
+            raise ConfigError(f"invalid environment name at {path}:{line_number}")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        values[name] = value
+    return values
+
+
+def load_config(path: Path, *, required: bool = False) -> dict[str, Any]:
+    if not path.exists():
+        if required:
+            raise ConfigError(f"configuration does not exist: {path}")
+        return {}
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"invalid configuration {path}: {exc}") from exc
+    unknown = set(data) - CONFIG_FIELDS
+    if unknown:
+        raise ConfigError(f"unknown configuration field(s): {', '.join(sorted(unknown))}")
+    if data.get("version", 1) != 1:
+        raise ConfigError(f"unsupported configuration version: {data.get('version')}")
+    for name in ("base_url", "api_key_env", "credentials_file", "default_complexity"):
+        if name in data and not isinstance(data[name], str):
+            raise ConfigError(f"configuration field {name!r} must be a string")
+    if "model" in data and data["model"] is not None and not isinstance(data["model"], str):
+        raise ConfigError("configuration field 'model' must be a string or null")
+    return data
+
+
+def validate_base_url(value: str) -> str:
+    normalized = value.strip().rstrip("/")
+    parsed = parse.urlparse(normalized)
+    if not parsed.hostname or parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise ConfigError("API URL must be an absolute URL without credentials, query, or fragment")
+    is_loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and is_loopback):
+        raise ConfigError("API URL must use HTTPS; HTTP is allowed only for loopback testing")
+    return normalized
+
+
+def resolve_api_key(
+    config: dict[str, Any], config_path: Path, env_values: dict[str, str] | None = None
+) -> str:
+    env_values = env_values or {}
+    env_name = config.get("api_key_env") or DEFAULT_API_KEY_ENV
+    api_key = os.environ.get(env_name, "") or env_values.get(env_name, "")
+    if not api_key:
+        api_key = env_values.get("API_KEY", "")
+    if api_key:
+        return api_key
+    credential_name = config.get("credentials_file") or "credentials.toml"
+    credential_path = Path(credential_name)
+    if not credential_path.is_absolute():
+        credential_path = config_path.parent / credential_path
+    if not credential_path.exists():
+        return ""
+    if stat.S_IMODE(credential_path.stat().st_mode) & 0o077:
+        raise ConfigError(f"credential file must not be group/world accessible: {credential_path}")
+    try:
+        credentials = tomllib.loads(credential_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"invalid credential file {credential_path}: {exc}") from exc
+    if set(credentials) != {"api_key"} or not isinstance(credentials.get("api_key"), str):
+        raise ConfigError("credential file must contain only a string 'api_key' field")
+    return credentials["api_key"]
+
+
+def fetch_models(base_url: str, api_key: str, timeout: int = 30) -> list[str]:
+    req = request.Request(
+        f"{validate_base_url(base_url)}/models",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "codex-corvex-delegate/1",
+        },
+        method="GET",
+    )
+    try:
+        with open_request(req, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        detail = exc.read(4000).decode("utf-8", errors="replace").replace(api_key, "[REDACTED]")
+        raise ConfigError(f"Corvex API returned HTTP {exc.code}: {detail}") from exc
+    except error.URLError as exc:
+        raise ConfigError(f"Corvex API request failed: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise ConfigError("Corvex API returned invalid JSON from /models") from exc
+    models = payload.get("data", []) if isinstance(payload, dict) else []
+    ids = sorted(
+        item.get("id", "") for item in models if isinstance(item, dict) and item.get("id")
+    )
+    if not ids:
+        raise ConfigError("Corvex API returned no model IDs")
+    return ids
+
+
+def verify_credential(base_url: str, api_key: str, model: str, timeout: int = 30) -> None:
+    """Model discovery is public; authenticate with a tiny inference request."""
+    payload = {"model": model, "messages": [{"role": "user", "content": "Reply OK."}],
+               "max_tokens": 1, "stream": False}
+    req = request.Request(
+        f"{validate_base_url(base_url)}/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with open_request(req, timeout=timeout) as response:
+            result = json.loads(response.read().decode())
+    except error.HTTPError as exc:
+        # Do not expose a remote response that may echo credentials.
+        raise ConfigError(f"Credential/inference check failed: HTTP {exc.code}") from exc
+    except (error.URLError, OSError, ValueError) as exc:
+        raise ConfigError("Credential/inference check failed; check connectivity and provider settings") from exc
+    if not isinstance(result, dict) or not result.get("choices") or result.get("error"):
+        raise ConfigError("Credential/inference check returned no completion choices")
+
+
+def probe_responses_api(base_url: str, api_key: str, model: str, timeout: int = 60) -> None:
+    """Verify the Responses SSE and function-call subset required by Codex agents."""
+    payload = {
+        "model": model,
+        "instructions": "You are a bounded compatibility probe.",
+        "input": "Call compatibility_probe exactly once with value set to ok.",
+        "stream": True,
+        "store": False,
+        "max_output_tokens": 256,
+        "reasoning": {"effort": "medium", "summary": "auto"},
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+            {
+                "type": "function",
+                "name": "compatibility_probe",
+                "description": "Return a fixed compatibility probe value.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            }
+        ],
+        "tool_choice": "required",
+        "parallel_tool_calls": False,
+    }
+    req = request.Request(
+        f"{validate_base_url(base_url)}/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Accept": "text/event-stream",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "codex-corvex-delegate-native-probe/1",
+        },
+        method="POST",
+    )
+    completed = False
+    function_call = False
+
+    def is_expected_call(item: Any) -> bool:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            return False
+        if item.get("name") != "compatibility_probe":
+            return False
+        arguments = item.get("arguments", "{}")
+        try:
+            parsed_arguments = arguments if isinstance(arguments, dict) else json.loads(arguments)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(parsed_arguments, dict) and parsed_arguments.get("value") == "ok"
+    try:
+        with open_request(req, timeout=timeout) as response:
+            if response.headers.get_content_type() != "text/event-stream":
+                raise ConfigError("Corvex Responses probe did not return an SSE stream")
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise ConfigError("Corvex Responses probe returned invalid SSE JSON") from exc
+                event_type = event.get("type") if isinstance(event, dict) else None
+                if event_type in {"response.failed", "error"}:
+                    detail = json.dumps(event, ensure_ascii=False).replace(api_key, "[REDACTED]")
+                    raise ConfigError(f"Corvex Responses probe failed: {detail[:4000]}")
+                if event_type == "response.output_item.done":
+                    item = event.get("item") or {}
+                    function_call = function_call or is_expected_call(item)
+                if event_type == "response.completed":
+                    completed = True
+                    response_payload = event.get("response") or {}
+                    function_call = function_call or any(
+                        is_expected_call(item) for item in response_payload.get("output", [])
+                    )
+    except error.HTTPError as exc:
+        detail = exc.read(4000).decode("utf-8", errors="replace").replace(api_key, "[REDACTED]")
+        raise ConfigError(f"Corvex Responses API returned HTTP {exc.code}: {detail}") from exc
+    except error.URLError as exc:
+        raise ConfigError(f"Corvex Responses API request failed: {exc.reason}") from exc
+    if not completed or not function_call:
+        raise ConfigError("Corvex Responses API did not complete an SSE function call")
+
+
+def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def write_configuration(
+    config_path: Path,
+    *,
+    base_url: str,
+    api_key: str,
+    model: str | None,
+    default_complexity: str = "medium",
+) -> None:
+    credential_path = config_path.parent / "credentials.toml"
+    config_content = "\n".join(
+        [
+            "version = 1",
+            f"base_url = {toml_string(validate_base_url(base_url))}",
+            f"model = {toml_string(model or '')}",
+            f"api_key_env = {toml_string(DEFAULT_API_KEY_ENV)}",
+            'credentials_file = "credentials.toml"',
+            f"default_complexity = {toml_string(default_complexity)}",
+            "",
+        ]
+    )
+    credentials_content = f"api_key = {toml_string(api_key)}\n"
+    atomic_write(credential_path, credentials_content, 0o600)
+    atomic_write(config_path, config_content, 0o600)
+
+
+def update_selected_model(config_path: Path, model: str | None) -> None:
+    config = load_config(config_path, required=True)
+    api_key = resolve_api_key(config, config_path)
+    if not api_key:
+        raise ConfigError("no Corvex API credential is configured")
+    write_configuration(
+        config_path,
+        base_url=config.get("base_url") or DEFAULT_BASE_URL,
+        api_key=api_key,
+        model=model,
+        default_complexity=config.get("default_complexity") or "medium",
+    )

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Corvex Delegate"
+  short_description: "Coordinate bounded Corvex delegates"
+  default_prompt: "Use $corvex-delegate target to turn my goal into a measurable execution loop."

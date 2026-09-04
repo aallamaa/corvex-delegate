@@ -1,0 +1,58 @@
+---
+name: corvex-delegate
+description: Delegate bounded repository work directly to Corvex models while Codex owns planning and verification. Use for provider setup, model selection, target refinement, and execution loops with measurable acceptance criteria.
+---
+
+# Corvex Delegate
+
+Keep architecture, targets, sequencing, review, and acceptance in Codex. Send bounded missions to Corvex through the bundled runner. OMP is not required and the primary Codex model is not changed.
+
+## Commands
+
+The word after `$corvex-delegate` is a skill instruction, not a registered slash command:
+
+| Instruction | Purpose |
+| --- | --- |
+| `configure` | Configure URL and credential |
+| `models [PATTERN]` | List live model IDs |
+| `select [MODEL_ID\|auto]` | Show, save, or clear the default model |
+| `check` | Verify credentials with a tiny inference request |
+| `target GOAL` | Define outcome and acceptance gates |
+| `analyze` | Assess gaps and propose work units |
+| `refine` | Clarify the target and plan |
+| `run` | Execute and verify one iteration |
+| `loop [CONDITION]` | Repeat within a bounded budget |
+| `audit` | Independently challenge completion |
+| `status` | Report progress and remaining gates |
+
+Read [control-protocol.md](references/control-protocol.md) for target and execution operations. Read [provider-setup.md](references/provider-setup.md) for setup and model selection.
+
+## Setup
+
+Find `scripts/corvex-delegate` relative to this skill's actual installation directory. Run `python3 <skill-dir>/scripts/corvex-delegate configure` in a local terminal for the hidden-input wizard. Never request keys in chat or pass them in command arguments. Codex may configure non-interactively from an existing environment variable or user-identified dotenv file.
+
+Settings default to `${CODEX_HOME:-~/.codex}/corvex-delegate/config.toml`, with the key in a separate mode-0600 `credentials.toml`. `configure` and `check` make a tiny inference request that may incur a charge. The public model catalog does not authenticate the key.
+
+## Delegation
+
+Read [mission-format.md](references/mission-format.md) before preparing a mission. Store target state, missions, and reports under `.codex/corvex-delegate/` in the target repository. Keep secrets out of all context sent to Corvex.
+
+Use an exact selected model. Split ambiguous or oversized work before delegation. Parallel read-only missions or independent worktrees are possible; serialize writes within a shared worktree.
+
+```bash
+python3 <skill-dir>/scripts/corvex-delegate run \
+  --mission /absolute/path/to/mission.md \
+  --cwd /absolute/path/to/repository \
+  --model exact-provider-model-id \
+  --complexity low --max-steps 16 --max-time 20m
+```
+
+Omit `--write` for analysis and review. Enable it only for authorized edits, and pass `--allow-command NAME` only for needed executables. Command execution is not a security sandbox; interpreters, compilers, and repository scripts can execute arbitrary code. File tools confine paths to the repository but do not guarantee that repository contents are secret-free. Use a sanitized checkout when needed.
+
+After each run, capture the report and exit status, inspect changes, independently rerun decisive checks, and update the ledger with evidence. Exit zero means a report was returned, not that the target passed. Timeouts and missing reports are incomplete work. Never weaken acceptance gates to obtain success.
+
+## Execution boundary
+
+The supported workflow uses the direct API runner. Cross-provider native subagents failed in the recorded Codex CLI 0.153.2 test: the child retained the OpenAI provider. A standalone Codex process using Corvex worked, but is a separate session. Optional native helpers are experimental; see [native-compatibility.md](references/native-compatibility.md). Do not enable them during normal installation or infer native support from an API probe.
+
+`loop` is a workflow within the active Codex session, not a background scheduler. Stop at independently verified completion, the budget, or a blocker requiring user input or expanded authority.
