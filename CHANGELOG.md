@@ -5,7 +5,42 @@ All notable changes to this skill are recorded here. This project follows
 
 ## [Unreleased]
 
+### Security
+
+- `COMMAND_ARGUMENT_DENYLIST` matched only the bare option token, so every
+  denied flag was reachable in a spelling the parser treats identically:
+  `ssh -oProxyCommand=/bin/sh` (glued) and `ssh -nNo ProxyCommand=...`
+  (clustered) both ran, while the separated `-o` form was refused. Matching now
+  covers all three spellings.
+- Added the options that were simply missing: `git -u` (short `--upload-pack`),
+  `git archive --exec`, `git --git-dir` / `--work-tree` (which point git at a
+  config file the delegate wrote, and so at `core.fsmonitor`), `ssh -I` (which
+  `dlopen()`s a PKCS#11 library, running its constructor before any network
+  traffic), and entries for `find` and `tar`, which were absent although
+  `-exec` and `--to-command` are the same class of escape.
+- Documented what the list is not. It closes the best-known one-liners and
+  nothing more: `git config alias.x '!cmd'` followed by `git x` uses no flag at
+  all. The README previously implied the risk was confined to interpreters,
+  compilers and build tools, which read as a guarantee about `git` and `ssh`
+  that was never true. Allow-listing a command grants everything that command
+  can do.
+
 ### Fixed
+
+- `MAX_TOOL_OUTPUT` was enforced as a character count while every neighbouring
+  limit, every message quoting it, and the delegate byte ledger meant UTF-8
+  bytes. A CJK or emoji file passed roughly three times the intended cap
+  straight to the provider -- the payload the limit exists to bound. `truncate`,
+  the `read_file` window budget and the `grep_search` accumulator now all
+  measure bytes, and `truncate` will not split a codepoint.
+- `read_file` appended its truncation notice after spending the whole budget,
+  pushing the result past the cap so `truncate` cut it again -- through the
+  notice, destroying the "continue from a later start_line" guidance that tells
+  the delegate how to page on. The notice is reserved inside the budget now.
+- `atomic_write` promised a new file created with `mode=None` would get the
+  process umask, but `NamedTemporaryFile` always creates at 0600 and nothing
+  reset it, so delegate-created files landed unreadable to anyone else. It
+  applies the umask now, and still preserves an existing file's permissions.
 
 - A provider response whose body died mid-read raised
   `http.client.IncompleteRead`, which descends from `Exception`, not `OSError`,

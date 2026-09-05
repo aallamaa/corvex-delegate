@@ -324,8 +324,15 @@ def atomic_write(path: Path, content: str, mode: int | None = 0o600) -> None:
     repository edits need: a delegate rewriting a script must not silently
     strip its execute bit. A new file under None gets the process umask.
     """
-    if mode is None and path.exists():
-        mode = stat.S_IMODE(path.stat().st_mode)
+    if mode is None:
+        if path.exists():
+            mode = stat.S_IMODE(path.stat().st_mode)
+        else:
+            # NamedTemporaryFile always creates at 0600, so a brand-new file
+            # would land far more restrictive than the umask this promises.
+            current = os.umask(0)
+            os.umask(current)
+            mode = 0o666 & ~current
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=path.parent, delete=False

@@ -81,10 +81,20 @@ COMMAND_ENV_ALLOWLIST = frozenset({
 
 # Flags that turn a benign-looking allow-listed binary into arbitrary
 # execution by pointing it at a model-supplied configuration or hook.
+# Options that turn an allow-listed binary into a runner for something else.
+# This is a speed bump, not a boundary: see the note above tool_run_command.
 COMMAND_ARGUMENT_DENYLIST = {
-    "git": ("-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack"),
-    "ssh": ("-o", "-F"),
+    # -u is git's short --upload-pack; --exec is git archive's; --git-dir and
+    # --work-tree point git at a config file the delegate controls, which is
+    # execution through core.fsmonitor or a hook.
+    "git": ("-c", "-u", "--config-env", "--exec", "--exec-path", "--upload-pack",
+            "--receive-pack", "--git-dir", "--work-tree"),
+    # -I dlopen()s a PKCS#11 library: its constructor runs before any network
+    # traffic, so a delegate that can write a .so can run it.
+    "ssh": ("-o", "-F", "-I"),
     "rsync": ("-e", "--rsh"),
+    "find": ("-exec", "-execdir", "-ok", "-okdir"),
+    "tar": ("-I", "--to-command", "--use-compress-program", "--checkpoint-action"),
 }
 
 # Repository-internal paths a delegate must never write, even in --write mode.
@@ -501,9 +511,19 @@ def cleanup_reports(
 
 
 def truncate(value: str, limit: int = MAX_TOOL_OUTPUT) -> str:
-    if len(value) <= limit:
+    """Bound a tool result by UTF-8 bytes, not characters.
+
+    Every other limit here is denominated in bytes, and bytes are what the
+    delegate ledger counts and what the provider is billed for. Counting
+    characters let a CJK or emoji file through at three to four times the
+    intended cap, which is exactly the payload this is meant to bound.
+    """
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
         return value
-    return value[:limit] + f"\n[truncated {len(value) - limit} characters]"
+    # errors="ignore" drops a codepoint the slice cut in half.
+    kept = encoded[:limit].decode("utf-8", errors="ignore")
+    return kept + f"\n[truncated {len(encoded) - len(kept.encode('utf-8'))} bytes]"
 
 
 @contextmanager
@@ -737,14 +757,19 @@ class RepositoryTools:
         # refusing to show ten lines of a large log because the rest of it is
         # long makes paging through one impossible.
         selected: list[str] = []
-        budget = MAX_TOOL_OUTPUT
+        # Reserve the notice up front. Appending it afterwards pushed the result
+        # past MAX_TOOL_OUTPUT, so truncate() cut it again and sliced the notice
+        # itself in half -- destroying the "continue from a later start_line"
+        # guidance that tells the delegate how to page on.
+        notice = f"\n[window truncated at {MAX_TOOL_OUTPUT} bytes; continue from a later start_line]"
+        budget = MAX_TOOL_OUTPUT - len(notice.encode("utf-8"))
         truncated = False
         with target.open(encoding="utf-8") as handle:
             for index, raw_line in enumerate(handle, 1):
                 if index < start_line:
                     continue
                 entry = f"{index}: {raw_line.rstrip(chr(10))}"
-                budget -= len(entry) + 1
+                budget -= len(entry.encode("utf-8")) + 1
                 if budget < 0:
                     truncated = True
                     break
@@ -753,7 +778,7 @@ class RepositoryTools:
                     break
         body = "\n".join(selected)
         if truncated:
-            body += f"\n[window truncated at {MAX_TOOL_OUTPUT} bytes; continue from a later start_line]"
+            body += notice
         return body
 
     def tool_list_files(self, glob: str = "*") -> str:
@@ -838,7 +863,7 @@ class RepositoryTools:
             if result.returncode not in (0, 1):
                 raise ValueError(result.stderr.strip() or "grep failed")
             output.append(result.stdout)
-            size += len(result.stdout)
+            size += len(result.stdout.encode("utf-8"))
             return size <= MAX_TOOL_OUTPUT
 
         # Naming files explicitly stops recursive grep from following symlinks
@@ -911,6 +936,16 @@ class RepositoryTools:
     def tool_run_command(
         self, argv: list[str], cwd: str = ".", timeout_seconds: int = 300
     ) -> str:
+        """Run one allow-listed executable.
+
+        COMMAND_ARGUMENT_DENYLIST closes the best-known one-line escapes, but it
+        is a speed bump and not a boundary. No flag list can make `git` safe:
+        `git config alias.x '!cmd'` followed by `git x` needs no flag at all,
+        and the same is true of any tool that reads a configuration file the
+        delegate can write. Allow-listing a command grants everything that
+        command can do; the environment allow-list and the repository jail are
+        what actually bound the damage.
+        """
         if not argv or not all(isinstance(item, str) and item for item in argv):
             raise ValueError("argv must contain non-empty strings")
         executable = self.allowed_commands.get(argv[0])
@@ -920,9 +955,7 @@ class RepositoryTools:
             raise ValueError("timeout_seconds must be an integer between 1 and 900")
         forbidden = COMMAND_ARGUMENT_DENYLIST.get(Path(executable).name, ())
         for argument in argv[1:]:
-            if argument in forbidden or any(
-                argument.startswith(f"{flag}=") for flag in forbidden if flag.startswith("--")
-            ):
+            if forbids(argument, forbidden):
                 raise ValueError(
                     f"argument is not permitted for {argv[0]}: {argument}; it can execute "
                     "an arbitrary command through configuration"
@@ -953,6 +986,39 @@ class RepositoryTools:
         if result.returncode != 0:
             raise ValueError(result.stderr.strip() or f"command failed: {' '.join(argv)}")
         return result.stdout
+
+def forbids(argument: str, forbidden: tuple[str, ...]) -> bool:
+    """Whether one argument reaches a denied option, in any spelling of it.
+
+    Matching the exact token is not enough. A short option that takes a value
+    can carry it glued on (`ssh -oProxyCommand=...`) or ride in a cluster whose
+    value follows (`ssh -nNo ProxyCommand=...`), and both reach the same option
+    parser that `-o` does. So a single-dash argument is refused whenever it
+    contains a denied short flag's letter at all; for the three binaries in the
+    denylist no benign short option shares those letters. Long options are
+    matched exactly or with an attached value.
+    """
+    if not argument.startswith("-"):
+        return False
+    for flag in forbidden:
+        if flag.startswith("--"):
+            if argument == flag or argument.startswith(f"{flag}="):
+                return True
+        elif argument.startswith("--"):
+            continue
+        elif len(flag) == 2:
+            # A short option that takes a value can carry it glued on
+            # (ssh -oProxyCommand=...) or ride in a cluster whose value follows
+            # (ssh -nNo ProxyCommand=...); both reach the same parser as -o.
+            if flag[1] in argument[1:]:
+                return True
+        elif argument == flag:
+            # A multi-letter single-dash option is a word, not a cluster:
+            # substring matching here would refuse find's benign -executable
+            # because it contains -exec.
+            return True
+    return False
+
 
 def function_tool(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
     return {

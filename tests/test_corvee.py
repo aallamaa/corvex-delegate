@@ -1248,6 +1248,91 @@ class WriteProtectionTest(unittest.TestCase):
         self.assertTrue(result["ok"], result)
 
 
+class NewFilePermissionTest(unittest.TestCase):
+    def test_a_new_file_gets_the_umask_not_0600(self) -> None:
+        # NamedTemporaryFile always creates at 0600, so mode=None used to
+        # contradict the documented umask behavior for new files.
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "created.txt"
+            corvee_config.atomic_write(target, "x", mode=None)
+            current = os.umask(0)
+            os.umask(current)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o666 & ~current)
+
+    def test_an_existing_files_permissions_are_still_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "script.sh"
+            target.write_text("old", encoding="utf-8")
+            target.chmod(0o755)
+            corvee_config.atomic_write(target, "new", mode=None)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+
+
+class ArgumentDenylistSpellingTest(unittest.TestCase):
+    """A denied option must be refused however it is spelled, not just bare."""
+
+    DENY = None
+
+    def setUp(self) -> None:
+        self.DENY = corvee.COMMAND_ARGUMENT_DENYLIST
+
+    def test_a_glued_short_option_is_refused(self) -> None:
+        # ssh -oProxyCommand=<cmd> is arbitrary execution and parses exactly
+        # like the separated form, which was already refused.
+        self.assertTrue(corvee.forbids("-oProxyCommand=/bin/sh", self.DENY["ssh"]))
+        self.assertTrue(corvee.forbids("-ccore.pager=sh", self.DENY["git"]))
+        self.assertTrue(corvee.forbids("-essh", self.DENY["rsync"]))
+
+    def test_a_clustered_short_option_is_refused(self) -> None:
+        # ssh -nNo ProxyCommand=<cmd> reaches the same option parser.
+        self.assertTrue(corvee.forbids("-nNo", self.DENY["ssh"]))
+
+    def test_the_bare_and_attached_long_forms_are_still_refused(self) -> None:
+        for argument in ("-o", "-F", "--rsh=ssh", "--exec-path=/tmp", "--config-env=x"):
+            forbidden = (self.DENY["ssh"] + self.DENY["rsync"] + self.DENY["git"])
+            with self.subTest(argument=argument):
+                self.assertTrue(corvee.forbids(argument, forbidden))
+
+    def test_options_that_name_a_program_to_run_are_refused(self) -> None:
+        # Each of these hands the binary a command or library to execute.
+        for argument, binary in (
+            ("-u", "git"),                      # short --upload-pack
+            ("--exec=/bin/sh", "git"),          # git archive
+            ("--git-dir=evil", "git"),          # delegate-controlled config
+            ("--work-tree=evil", "git"),
+            ("-I", "ssh"),                      # dlopen()s a PKCS#11 library
+            ("-exec", "find"),
+            ("-execdir", "find"),
+            ("--to-command=/bin/sh", "tar"),
+            ("-I", "tar"),
+        ):
+            with self.subTest(binary=binary, argument=argument):
+                self.assertTrue(corvee.forbids(argument, self.DENY[binary]))
+
+    def test_a_multi_letter_word_option_is_matched_exactly(self) -> None:
+        # find's -executable is benign and contains "-exec"; cluster matching
+        # is only correct for single-letter flags.
+        self.assertFalse(corvee.forbids("-executable", self.DENY["find"]))
+        self.assertFalse(corvee.forbids("-name", self.DENY["find"]))
+        self.assertFalse(corvee.forbids("-xzf", self.DENY["tar"]))
+
+    def test_benign_options_and_operands_are_untouched(self) -> None:
+        self.assertFalse(corvee.forbids("-p", self.DENY["ssh"]))
+        self.assertFalse(corvee.forbids("-i", self.DENY["ssh"]))
+        self.assertFalse(corvee.forbids("-C", self.DENY["git"]))
+        self.assertFalse(corvee.forbids("--version", self.DENY["git"]))
+        self.assertFalse(corvee.forbids("-avz", self.DENY["rsync"]))
+        self.assertFalse(corvee.forbids("origin/main", self.DENY["git"]))
+
+    def test_the_runner_refuses_a_glued_option_end_to_end(self) -> None:
+        if shutil.which("ssh") is None:
+            self.skipTest("ssh unavailable")
+        tools = corvee.RepositoryTools(Path.cwd(), False, {"ssh"})
+        with self.assertRaises(ValueError) as refused:
+            tools.tool_run_command(["ssh", "-oProxyCommand=/bin/sh", "host"], timeout_seconds=1)
+        self.assertIn("not permitted", str(refused.exception))
+
+
 class CommandEnvironmentTest(unittest.TestCase):
     """run_command exposes an allow-list, not everything without a suspicious name."""
 
@@ -1941,6 +2026,45 @@ class WindowedReadTest(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertIn("window truncated", result["result"])
         self.assertLessEqual(len(result["result"]), corvee.MAX_TOOL_OUTPUT + 200)
+
+    def test_the_truncation_notice_survives_intact(self) -> None:
+        # The notice used to be appended after the budget was spent, pushing the
+        # result over the cap so truncate() sliced the notice in half and
+        # destroyed the paging guidance.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "big.txt").write_text("\n".join("x" * 200 for _ in range(400)),
+                                          encoding="utf-8")
+            tools = corvee.RepositoryTools(root, False, set())
+            body = json.loads(tools.execute("read_file", {"path": "big.txt",
+                                                          "line_count": 1000}))["result"]
+        self.assertLessEqual(len(body.encode("utf-8")), corvee.MAX_TOOL_OUTPUT)
+        self.assertTrue(body.endswith("continue from a later start_line]"), body[-120:])
+        self.assertNotIn("[truncated", body)
+
+    def test_a_non_ascii_window_is_capped_by_bytes_not_characters(self) -> None:
+        # Counting characters let a CJK file through at ~3x the intended cap.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "cjk.txt").write_text("\n".join("世" * 200 for _ in range(400)),
+                                          encoding="utf-8")
+            tools = corvee.RepositoryTools(root, False, set())
+            result = json.loads(tools.execute("read_file", {"path": "cjk.txt", "line_count": 1000}))
+            self.assertTrue(result["ok"], result)
+            body = result["result"]
+            self.assertIn("window truncated", body)
+            self.assertLessEqual(len(body.encode("utf-8")), corvee.MAX_TOOL_OUTPUT + 200)
+
+    def test_truncate_bounds_bytes_and_never_splits_a_codepoint(self) -> None:
+        value = "é" * corvee.MAX_TOOL_OUTPUT
+        result = corvee.truncate(value)
+        self.assertLessEqual(len(result.encode("utf-8")), corvee.MAX_TOOL_OUTPUT + 64)
+        self.assertIn("bytes]", result)
+        # Decodes cleanly: the slice did not leave half a codepoint behind.
+        result.encode("utf-8").decode("utf-8")
+
+    def test_ascii_output_under_the_cap_is_untouched(self) -> None:
+        self.assertEqual(corvee.truncate("plain"), "plain")
 
     def test_binary_content_still_fails_cleanly(self) -> None:
         (self.root / "blob.bin").write_bytes(b"\xff\xfe\x00binary")

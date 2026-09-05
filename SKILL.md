@@ -69,6 +69,8 @@ The runner prints one line per run boundary and error to stderr; the full event 
 
 Write tools refuse `.git/` and `.codex/corvee/reports/` after symlink resolution: the first would grant execution through hooks or `core.sshCommand` on your next git operation, the second holds the evidence you audit. Both stay readable. Allow-listed commands receive only a fixed environment allow-list (`PATH`, `HOME`, locale, and similar), so agent sockets and provider variables are not inherited.
 
+Allow-listing a command grants everything that command can do. Options that point a binary at another program to run are refused for `git`, `ssh`, `rsync`, `find` and `tar`, in every spelling of them, but that is a speed bump rather than a boundary: `git config alias.x '!cmd'` needs no flag at all. Allow-list the narrowest command that satisfies the gate.
+
 Allowed executables are resolved at startup; delegate commands must use the exact authorized name or path. Search and listing prefer `rg` and fall back to `grep` with extended regular expressions and a plain directory walk. Both fallbacks skip hidden entries and symlinks but do not honor `.gitignore`, so ignored private files must be removed from shared checkouts. Linux/macOS wall-clock deadlines interrupt blocked requests and terminate active command process groups; deliberately detached processes are not sandboxed.
 
 ## After a run
