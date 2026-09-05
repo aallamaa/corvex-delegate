@@ -5,6 +5,30 @@ All notable changes to this skill are recorded here. This project follows
 
 ## [Unreleased]
 
+### Changed
+
+- The delegate can no longer run commands. `run_command`, `--allow-command`,
+  the environment allow-list and the option denylist are all gone -- roughly
+  160 lines of runner and 200 of tests whose whole job was to re-implement, in
+  Python, a weak version of process isolation. The denylist could not hold in
+  principle: no flag list makes `git` safe when `git config alias.x '!cmd'`
+  followed by `git x` uses no flag at all. The protocol already required the
+  planner to rerun every gate command itself, so this removes a second and
+  worse execution path rather than a capability. Execution now happens only in
+  the planner's session, where the user's own sandbox and approval apply.
+- New `request_command` tool in its place. It executes nothing: it records a
+  command and a reason, writes both to `report.md` and `status.json`, and stops
+  the run at the new exit code `65` with the conversation checkpointed. The
+  planner runs the command if it chooses to -- refusing is a legitimate answer
+  -- and resumes with `run --resume <run-dir> --command-result <file>`. The
+  output is injected as evidence, explicitly labelled not-instructions, capped
+  at 100 KB. Resuming a suspended run without `--command-result` is refused
+  rather than silently continuing with the question unanswered, and the flag is
+  refused on a run that did not ask for anything.
+- The stop happens only after every tool call in the batch is answered: an
+  assistant message with an unanswered tool call is not a resumable
+  conversation.
+
 ### Security
 
 - `COMMAND_ARGUMENT_DENYLIST` matched only the bare option token, so every

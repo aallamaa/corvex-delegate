@@ -59,7 +59,15 @@ python3 <skill-dir>/scripts/corvee run \
   --complexity low
 ```
 
-Omit `--write` for analysis and review. Enable it only for authorized edits, and pass `--allow-command NAME` only for needed executables. Command execution is not a security sandbox; interpreters, compilers, and repository scripts can execute arbitrary code. File tools confine paths to the repository but do not guarantee that repository contents are secret-free. Use a sanitized checkout when needed.
+Omit `--write` for analysis and review; enable it only for authorized edits. The delegate reads, searches and edits; it cannot execute anything. File tools confine paths to the repository but do not guarantee that repository contents are secret-free. Use a sanitized checkout when needed.
+
+When the delegate needs something only a command can answer, it calls `request_command` and the run stops with exit `65`. Nothing has been executed. `report.md` names the command and the reason, and `status.json` repeats them under `command_request`. You decide whether to run it — this is the point where the user's own approval and sandbox apply, and refusing is a legitimate answer. To continue, capture stdout, stderr and the exit code into a file and resume:
+
+```bash
+python3 <skill-dir>/scripts/corvee run --resume <run-dir> --command-result /absolute/path/to/output.txt
+```
+
+The output is handed back as evidence, not as instructions. Prefer to answer the question in the next mission instead: a request costs a full round trip, so a delegate asking to run the gate on every iteration is a sign the mission was underspecified, not a workflow.
 
 The runner prints one line per run boundary and error to stderr; the full event stream stays in `events.jsonl` unless you pass `--verbose`. Read `status.json` rather than scrolling the stream.
 
@@ -67,11 +75,9 @@ The runner prints one line per run boundary and error to stderr; the full event 
 
 ## Boundaries the runner enforces
 
-Write tools refuse `.git/` and `.codex/corvee/reports/` after symlink resolution: the first would grant execution through hooks or `core.sshCommand` on your next git operation, the second holds the evidence you audit. Both stay readable. Allow-listed commands receive only a fixed environment allow-list (`PATH`, `HOME`, locale, and similar), so agent sockets and provider variables are not inherited.
+Write tools refuse `.git/` and `.codex/corvee/reports/` after symlink resolution: the first would grant execution through hooks or `core.sshCommand` on your next git operation, the second holds the evidence you audit. Both stay readable.
 
-Allow-listing a command grants everything that command can do. Options that point a binary at another program to run are refused for `git`, `ssh`, `rsync`, `find` and `tar`, in every spelling of them, but that is a speed bump rather than a boundary: `git config alias.x '!cmd'` needs no flag at all. Allow-list the narrowest command that satisfies the gate.
-
-Allowed executables are resolved at startup; delegate commands must use the exact authorized name or path. Search and listing prefer `rg` and fall back to `grep` with extended regular expressions and a plain directory walk. Both fallbacks skip hidden entries and symlinks but do not honor `.gitignore`, so ignored private files must be removed from shared checkouts. Linux/macOS wall-clock deadlines interrupt blocked requests and terminate active command process groups; deliberately detached processes are not sandboxed.
+Search and listing prefer `rg` and fall back to `grep` with extended regular expressions and a plain directory walk. Both fallbacks skip hidden entries and symlinks but do not honor `.gitignore`, so ignored private files must be removed from shared checkouts. Linux/macOS wall-clock deadlines interrupt blocked requests and terminate the runner's own search and git subprocesses.
 
 ## After a run
 
@@ -79,6 +85,6 @@ Capture the report and exit status, rerun the gate command yourself, read the ch
 
 `--complexity` picks the step and time budget: `low` is 16 steps and 20 minutes, `medium` 32 and 60, `high` 48 and 120. Pass `--max-steps` or `--max-time` only to override one of them.
 
-Requests default to a 600-second timeout within the total run budget. On failure or incomplete wrap-up, follow the recovery guidance in [control-protocol.md](references/control-protocol.md) before retrying; prefer `scripts/corvee run --resume <run-dir>` to continue from checkpoint instead of reissuing the same mission from scratch. Resuming reuses the original run's `--write` mode and `--allow-command` list; passing a conflicting one is refused.
+Requests default to a 600-second timeout within the total run budget. On failure or incomplete wrap-up, follow the recovery guidance in [control-protocol.md](references/control-protocol.md) before retrying; prefer `scripts/corvee run --resume <run-dir>` to continue from checkpoint instead of reissuing the same mission from scratch. Resuming reuses the original run's `--write` mode; asking for `--write` on a run that was read-only is refused.
 
 `loop` is a workflow within the active Codex session, not a background scheduler. Stop at independently verified completion, the budget, or a blocker requiring user input or expanded authority.

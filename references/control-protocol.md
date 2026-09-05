@@ -120,7 +120,9 @@ The runner creates a private per-run artifact directory automatically; use `--ru
 
 Request timeouts default to 600 seconds; retain that allowance for slow models unless the user requests less. The total run budget still wins. A transient request can retry once (up to two with `--request-retries 2`), with possible duplicate provider charges, but completed local tools are not rerun. Do not restart an entire mission merely because one inference request timed out.
 
-The final step/time reserve requests a tools-disabled report. Repeated identical results or consecutive tool errors trigger early wrap-up. Exit `2` means the invocation itself was unusable, `3` is an incomplete report, `75` is exhausted transient retries, and `124` is budget exhaustion. None closes an acceptance gate. Inspect diagnostics before increasing limits or changing model/scope.
+The final step/time reserve requests a tools-disabled report. Repeated identical results or consecutive tool errors trigger early wrap-up. Exit `2` means the invocation itself was unusable, `3` is an incomplete report, `65` is a run suspended awaiting a command you were asked to run, `75` is exhausted transient retries, and `124` is budget exhaustion. None closes an acceptance gate.
+
+Exit `65` is not a failure: the delegate called `request_command`, nothing was executed, and `report.md` names the command and why it was asked for. Judge it as you would any request for authority. Running it is your decision and happens in your own session under your own approval; refusing and resuming with a file that says so is a legitimate answer, as is answering the question in the next mission instead. Do not paste the output into a new mission by hand -- resume with `--command-result <file>` so the conversation continues rather than restarting. A delegate that asks to run the gate on every iteration is telling you the mission was underspecified: each request costs a full round trip, which is the expensive side of the trade. Inspect diagnostics before increasing limits or changing model/scope.
 
 ### `loop [CONDITION] [budget]`
 

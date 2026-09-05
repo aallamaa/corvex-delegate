@@ -27,8 +27,13 @@ dependency upgrade, or destructive command unless explicitly authorized here.
 ## Required work
 Concrete implementation or analysis tasks.
 
-## Verification requested from the delegate
-Checks the delegate should perform if their executables were explicitly enabled.
+## Verification the delegate can offer
+Evidence the delegate can gather by reading -- the code path it changed, the
+call sites it checked. The delegate cannot run anything, so this is reasoning
+to be checked, never a claim that a test passed. It may call `request_command`
+to ask you to run something, which suspends the run; say here whether that is
+worth a round trip for this mission, or whether it should report what it has
+and let the next iteration carry the answer.
 
 ## Evidence report
 - summary of result;

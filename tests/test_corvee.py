@@ -266,6 +266,8 @@ class CorveeTest(unittest.TestCase):
             self.assertIn("1: hello", result.stdout)
             self.assertNotIn("write_file", MockHandler.tools_seen)
             self.assertNotIn("replace_text", MockHandler.tools_seen)
+            # run_command no longer exists: the delegate reads and edits, and
+            # the planner runs the gate itself.
             self.assertNotIn("run_command", MockHandler.tools_seen)
             self.assertNotIn("test-secret", result.stdout + result.stderr)
 
@@ -284,8 +286,6 @@ class CorveeTest(unittest.TestCase):
                     "--cwd",
                     str(root),
                     "--write",
-                    "--allow-command",
-                    "cargo",
                     "--dry-run",
                 ],
                 env=self.environment,
@@ -294,7 +294,6 @@ class CorveeTest(unittest.TestCase):
                 check=True,
             )
             self.assertIn('"mode": "write"', result.stderr)
-            self.assertIn('"cargo"', result.stderr)
             self.assertNotIn("test-secret", result.stdout + result.stderr)
 
     def test_configure_then_use_saved_configuration(self) -> None:
@@ -590,7 +589,7 @@ class FinalAuditFixTest(unittest.TestCase):
             root = Path(directory)
             path = root / "file.txt"
             path.write_text("x")
-            tools = corvee.RepositoryTools(root, True, set())
+            tools = corvee.RepositoryTools(root, True)
             with self.assertRaises(ValueError):
                 tools.tool_read_file("file.txt", line_count=2000)
             with self.assertRaises(ValueError):
@@ -615,7 +614,7 @@ class RunnerRecoveryTest(unittest.TestCase):
         self.assertEqual(corvee.ApiClient("https://example.com", "fake").timeout, 600)
 
     def test_final_step_disables_tools_and_marks_report_incomplete(self):
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         with patch.object(client, "call", return_value=self.response("partial findings")) as call:
             result = corvee.run_steps(client, tools, [], "mock", None, 1, 100)
@@ -626,21 +625,21 @@ class RunnerRecoveryTest(unittest.TestCase):
         self.assertNotIn("tool_choice", call.call_args.args[2])
 
     def test_disabled_tools_are_not_executed_during_wrapup(self):
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         with patch.object(client, "call", return_value=self.response(calls=[self.tool_call()])), patch.object(tools, "execute") as execute:
             self.assertEqual(corvee.run_steps(client, tools, [], "mock", None, 1, 100), 3)
         execute.assert_not_called()
 
     def test_transient_retry_does_not_replay_completed_tool(self):
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         with patch.object(client, "call", side_effect=[self.response(calls=[self.tool_call()]), corvee_config.TransportError("request_timeout", True), self.response("done")]), patch.object(tools, "execute", return_value='{"ok":true,"result":"file"}') as execute, patch.object(corvee.time, "sleep"):
             self.assertEqual(corvee.run_steps(client, tools, [], "mock", None, 5, 100), 0)
         self.assertEqual(execute.call_count, 1)
 
     def test_retry_limit_and_permanent_failure(self):
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         for retryable, expected_calls, code in [(True, 2, 75), (False, 1, 1)]:
             client = corvee.ApiClient("https://example.com", "fake")
             with patch.object(client, "call", side_effect=corvee_config.TransportError("failure", retryable)) as call, patch.object(corvee.time, "sleep"), self.assertRaises(SystemExit) as error:
@@ -659,7 +658,7 @@ class RunnerRecoveryTest(unittest.TestCase):
         self.assertNotIn("sensitive error", str(error.exception))
 
     def test_repeated_results_trigger_wrapup(self):
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         with patch.object(client, "call", side_effect=[self.response(calls=[self.tool_call()])] * 3 + [self.response("partial")]) as call, patch.object(tools, "execute", return_value='{"ok":true,"result":"same"}') as execute:
             result = corvee.run_steps(client, tools, [], "mock", None, 20, 100)
@@ -770,7 +769,7 @@ class RunnerRecoveryTest(unittest.TestCase):
             self.assertEqual(context["cwd"], str(Path(directory)))
 
     def test_wrap_up_message_is_single_when_time_reserve_exhausted(self):
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
         with patch.object(client, "call", return_value=None), patch.object(corvee.time, "monotonic", side_effect=lambda: 0.9), patch.object(corvee.time, "sleep"):
@@ -821,7 +820,7 @@ class RunnerRecoveryTest(unittest.TestCase):
             self.assertNotIn("saved evidence", (artifacts / "events.jsonl").read_text())
 
     def test_time_reserve_switches_to_reporting(self):
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         # Run starts at zero; the first step starts inside the 20-second reserve.
         times = iter([0, 85, 85, 85, 85, 85, 85])
@@ -841,7 +840,7 @@ class AuditRegressionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "sample.txt").write_text("--pre=/usr/bin/printenv\n")
-            tools = corvee.RepositoryTools(root, False, set())
+            tools = corvee.RepositoryTools(root, False)
             result = tools.tool_search_text("--pre=/usr/bin/printenv")
             self.assertIn("sample.txt:1:--pre=/usr/bin/printenv", result)
 
@@ -856,7 +855,7 @@ class AuditRegressionTest(unittest.TestCase):
             outside = Path(directory) / "outside.txt"
             outside.write_text("outside-secret\n")
             (root / "linked.txt").symlink_to(outside)
-            tools = corvee.RepositoryTools(root, False, set())
+            tools = corvee.RepositoryTools(root, False)
             with without_ripgrep():
                 result = tools.tool_search_text("alpha[0-9]+", "*.txt")
                 self.assertIn("sample.txt:2:alpha42", result)
@@ -866,18 +865,6 @@ class AuditRegressionTest(unittest.TestCase):
                 self.assertEqual(tools.tool_search_text("no-match"), "")
                 self.assertFalse(json.loads(tools.execute("search_text", {"pattern": "["}))["ok"])
 
-    def test_command_allowlist_pins_executable_and_rejects_path_substitution(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            tools = corvee.RepositoryTools(root, False, {"echo"})
-            (root / "echo").symlink_to(shutil.which("true"))
-            for name in (str(root / "echo"), "./echo"):
-                with self.assertRaises(ValueError):
-                    tools.tool_run_command([name])
-            with patch.dict(os.environ, {"PATH": str(root)}):
-                self.assertIn("pinned-marker", tools.tool_run_command(["echo", "pinned-marker"]))
-            with self.assertRaises(ValueError):
-                tools.tool_run_command(["echo"], timeout_seconds=0)
 
     def test_model_selection_preserves_credentials_and_settings(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -904,26 +891,13 @@ class AuditRegressionTest(unittest.TestCase):
         def blocked(*args):
             time.sleep(2)
             return {"choices": [{"message": {"content": "late report"}}]}
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         started = time.monotonic()
         with patch.object(client, "call", side_effect=blocked), self.assertRaises(SystemExit) as error:
             with corvee.execution_deadline(0.1):
                 corvee.run_steps(client, tools, [], "mock", None, 2, 0.1)
         self.assertEqual(error.exception.code, 124)
-        self.assertLess(time.monotonic() - started, 1)
-
-    def test_deadline_stops_tool_batch_and_kills_command(self):
-        tools = corvee.RepositoryTools(Path.cwd(), False, {sys.executable})
-        client = corvee.ApiClient("https://example.com", "fake")
-        call = {"id": "1", "function": {"name": "run_command", "arguments": json.dumps({"argv": [sys.executable, "-c", "import time; time.sleep(5)"]})}}
-        response = {"choices": [{"message": {"tool_calls": [call, call]}}]}
-        started = time.monotonic()
-        with patch.object(client, "call", return_value=response), patch.object(tools, "execute", wraps=tools.execute) as execute, self.assertRaises(SystemExit) as error:
-            with corvee.execution_deadline(0.1):
-                corvee.run_steps(client, tools, [], "mock", None, 2, 0.1)
-        self.assertEqual(error.exception.code, 124)
-        self.assertEqual(execute.call_count, 1)
         self.assertLess(time.monotonic() - started, 1)
 
 
@@ -1197,7 +1171,7 @@ class WriteProtectionTest(unittest.TestCase):
         )
         (self.root / "src").mkdir()
         (self.root / "src" / "app.py").write_text("value = 1\n", encoding="utf-8")
-        self.tools = corvee.RepositoryTools(self.root, True, set())
+        self.tools = corvee.RepositoryTools(self.root, True)
 
     def test_write_file_rejects_git_directory(self) -> None:
         result = json.loads(self.tools.execute(
@@ -1248,6 +1222,135 @@ class WriteProtectionTest(unittest.TestCase):
         self.assertTrue(result["ok"], result)
 
 
+class RequestCommandTest(unittest.TestCase):
+    """The delegate can ask for a command; it can never run one."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.tools = corvee.RepositoryTools(self.root, False)
+
+    def test_the_tool_is_offered_and_executes_nothing(self) -> None:
+        names = [schema["function"]["name"] for schema in self.tools.schemas()]
+        self.assertIn("request_command", names)
+        self.assertNotIn("run_command", names)
+        marker = self.root / "ran"
+        result = json.loads(self.tools.execute("request_command", {
+            "argv": ["touch", str(marker)], "reason": "prove nothing runs"}))
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(marker.exists(), "request_command must not execute anything")
+        self.assertEqual(self.tools.pending_request,
+                         {"argv": ["touch", str(marker)], "reason": "prove nothing runs"})
+
+    def test_a_malformed_request_is_refused(self) -> None:
+        for arguments in ({"argv": [], "reason": "x"},
+                          {"argv": ["ls", ""], "reason": "x"},
+                          {"argv": "ls", "reason": "x"},
+                          {"argv": ["ls"], "reason": "   "}):
+            with self.subTest(arguments=arguments):
+                result = json.loads(self.tools.execute("request_command", arguments))
+                self.assertFalse(result["ok"], result)
+        self.assertIsNone(self.tools.pending_request)
+
+    def test_a_second_request_in_one_batch_is_refused(self) -> None:
+        self.tools.execute("request_command", {"argv": ["a"], "reason": "first"})
+        second = json.loads(self.tools.execute("request_command", {"argv": ["b"], "reason": "second"}))
+        self.assertFalse(second["ok"], second)
+        self.assertEqual(self.tools.pending_request["argv"], ["a"])
+
+    def test_a_request_stops_the_run_and_records_it(self) -> None:
+        client = corvee.ApiClient("https://example.com", "fake")
+        call = {"id": "c1", "function": {"name": "request_command",
+                "arguments": json.dumps({"argv": ["pytest", "-q"], "reason": "the gate"})}}
+        response = {"choices": [{"message": {"tool_calls": [call]}}]}
+        journal = corvee.RunJournal(self.root / "run", "")
+        with patch.object(client, "call", return_value=response):
+            code = corvee.run_steps(client, self.tools, [], "mock", None, 6, 100, journal=journal)
+        self.assertEqual(code, corvee.EXIT_COMMAND_REQUESTED)
+        self.assertEqual(journal.command_request["argv"], ["pytest", "-q"])
+        report = (journal.directory / "report.md").read_text(encoding="utf-8")
+        self.assertIn("Command requested", report)
+        self.assertIn("pytest -q", report)
+        self.assertIn("--command-result", report)
+        checkpoint = json.loads((journal.directory / "checkpoint.json").read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint["phase"], "command_requested")
+        # Every tool call is answered, or the conversation cannot be resumed.
+        roles = [message["role"] for message in checkpoint["messages"]]
+        self.assertEqual(roles[-1], "tool")
+
+    def test_status_json_carries_the_request(self) -> None:
+        journal = corvee.RunJournal(self.root / "run", "")
+        journal.command_request = {"argv": ["make", "test"], "reason": "the gate"}
+        journal.finish("command_requested", corvee.EXIT_COMMAND_REQUESTED)
+        status = json.loads((journal.directory / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["status"], "command_requested")
+        self.assertEqual(status["exit_code"], 65)
+        self.assertEqual(status["command_request"]["argv"], ["make", "test"])
+
+    def test_a_run_that_requested_nothing_records_no_request(self) -> None:
+        journal = corvee.RunJournal(self.root / "run", "")
+        journal.finish("report_returned", 0)
+        status = json.loads((journal.directory / "status.json").read_text(encoding="utf-8"))
+        self.assertIsNone(status["command_request"])
+
+
+class RequestCommandResumeTest(unittest.TestCase):
+    """Resuming a suspended run needs the planner's output, and injects it."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.run_dir = self.root / "run"
+        self.run_dir.mkdir()
+        (self.run_dir / "checkpoint.json").write_text(json.dumps({
+            "version": 1,
+            "step": 2,
+            "phase": "command_requested",
+            "messages": [{"role": "system", "content": "s"}],
+            "run_context": {"cwd": str(self.root), "write": False},
+        }), encoding="utf-8")
+
+    def resume(self, *extra):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--no-config", "--resume", str(self.run_dir),
+             "--cwd", str(self.root), "--model", "mock", "--dry-run", "--verbose", *extra],
+            env={"CORVEX_API_KEY": "test-secret", "CORVEX_MODEL": "mock"},
+            text=True, capture_output=True,
+        )
+
+    def test_resuming_without_the_output_is_refused_with_guidance(self) -> None:
+        result = self.resume()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--command-result", result.stderr)
+
+    def test_resuming_with_the_output_is_accepted(self) -> None:
+        output = self.root / "out.txt"
+        output.write_text("exit_code=1\nFAILED test_x\n", encoding="utf-8")
+        result = self.resume("--command-result", str(output))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_oversized_result_is_refused(self) -> None:
+        output = self.root / "big.txt"
+        output.write_text("x" * (corvee.MAX_COMMAND_RESULT_BYTES + 1), encoding="utf-8")
+        result = self.resume("--command-result", str(output))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("exceeds", result.stderr)
+
+    def test_the_flag_is_refused_on_an_ordinary_resume(self) -> None:
+        (self.run_dir / "checkpoint.json").write_text(json.dumps({
+            "version": 1, "step": 2, "phase": "assistant",
+            "messages": [{"role": "system", "content": "s"}],
+            "run_context": {"cwd": str(self.root), "write": False},
+        }), encoding="utf-8")
+        output = self.root / "out.txt"
+        output.write_text("x", encoding="utf-8")
+        result = self.resume("--command-result", str(output))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("only meaningful", result.stderr)
+
+
 class NewFilePermissionTest(unittest.TestCase):
     def test_a_new_file_gets_the_umask_not_0600(self) -> None:
         # NamedTemporaryFile always creates at 0600, so mode=None used to
@@ -1268,94 +1371,6 @@ class NewFilePermissionTest(unittest.TestCase):
             self.assertEqual(target.stat().st_mode & 0o777, 0o755)
 
 
-class ArgumentDenylistSpellingTest(unittest.TestCase):
-    """A denied option must be refused however it is spelled, not just bare."""
-
-    DENY = None
-
-    def setUp(self) -> None:
-        self.DENY = corvee.COMMAND_ARGUMENT_DENYLIST
-
-    def test_a_glued_short_option_is_refused(self) -> None:
-        # ssh -oProxyCommand=<cmd> is arbitrary execution and parses exactly
-        # like the separated form, which was already refused.
-        self.assertTrue(corvee.forbids("-oProxyCommand=/bin/sh", self.DENY["ssh"]))
-        self.assertTrue(corvee.forbids("-ccore.pager=sh", self.DENY["git"]))
-        self.assertTrue(corvee.forbids("-essh", self.DENY["rsync"]))
-
-    def test_a_clustered_short_option_is_refused(self) -> None:
-        # ssh -nNo ProxyCommand=<cmd> reaches the same option parser.
-        self.assertTrue(corvee.forbids("-nNo", self.DENY["ssh"]))
-
-    def test_the_bare_and_attached_long_forms_are_still_refused(self) -> None:
-        for argument in ("-o", "-F", "--rsh=ssh", "--exec-path=/tmp", "--config-env=x"):
-            forbidden = (self.DENY["ssh"] + self.DENY["rsync"] + self.DENY["git"])
-            with self.subTest(argument=argument):
-                self.assertTrue(corvee.forbids(argument, forbidden))
-
-    def test_options_that_name_a_program_to_run_are_refused(self) -> None:
-        # Each of these hands the binary a command or library to execute.
-        for argument, binary in (
-            ("-u", "git"),                      # short --upload-pack
-            ("--exec=/bin/sh", "git"),          # git archive
-            ("--git-dir=evil", "git"),          # delegate-controlled config
-            ("--work-tree=evil", "git"),
-            ("-I", "ssh"),                      # dlopen()s a PKCS#11 library
-            ("-exec", "find"),
-            ("-execdir", "find"),
-            ("--to-command=/bin/sh", "tar"),
-            ("-I", "tar"),
-        ):
-            with self.subTest(binary=binary, argument=argument):
-                self.assertTrue(corvee.forbids(argument, self.DENY[binary]))
-
-    def test_a_multi_letter_word_option_is_matched_exactly(self) -> None:
-        # find's -executable is benign and contains "-exec"; cluster matching
-        # is only correct for single-letter flags.
-        self.assertFalse(corvee.forbids("-executable", self.DENY["find"]))
-        self.assertFalse(corvee.forbids("-name", self.DENY["find"]))
-        self.assertFalse(corvee.forbids("-xzf", self.DENY["tar"]))
-
-    def test_benign_options_and_operands_are_untouched(self) -> None:
-        self.assertFalse(corvee.forbids("-p", self.DENY["ssh"]))
-        self.assertFalse(corvee.forbids("-i", self.DENY["ssh"]))
-        self.assertFalse(corvee.forbids("-C", self.DENY["git"]))
-        self.assertFalse(corvee.forbids("--version", self.DENY["git"]))
-        self.assertFalse(corvee.forbids("-avz", self.DENY["rsync"]))
-        self.assertFalse(corvee.forbids("origin/main", self.DENY["git"]))
-
-    def test_the_runner_refuses_a_glued_option_end_to_end(self) -> None:
-        if shutil.which("ssh") is None:
-            self.skipTest("ssh unavailable")
-        tools = corvee.RepositoryTools(Path.cwd(), False, {"ssh"})
-        with self.assertRaises(ValueError) as refused:
-            tools.tool_run_command(["ssh", "-oProxyCommand=/bin/sh", "host"], timeout_seconds=1)
-        self.assertIn("not permitted", str(refused.exception))
-
-
-class CommandEnvironmentTest(unittest.TestCase):
-    """run_command exposes an allow-list, not everything without a suspicious name."""
-
-    def test_only_allow_listed_variables_reach_the_command(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            tools = corvee.RepositoryTools(root, False, {"env"})
-            leaky = {
-                "SSH_AUTH_SOCK": "/tmp/agent.sock",
-                "AWS_SESSION": "leaked",
-                "GH_ENTERPRISE_HOST": "internal.example",
-                "CORVEX_API_URL": "https://provider.example/v1",
-                # With --write a delegate can drop a sitecustomize.py for any
-                # allow-listed interpreter to import.
-                "PYTHONPATH": "/tmp/attacker",
-            }
-            with patch.dict(os.environ, leaky):
-                result = json.loads(tools.execute("run_command", {"argv": ["env"]}))
-            self.assertTrue(result["ok"], result)
-            output = result["result"]
-            for name in leaky:
-                self.assertNotIn(name, output)
-            self.assertIn("PATH=", output)
 
 
 class GrepFallbackTest(unittest.TestCase):
@@ -1367,7 +1382,7 @@ class GrepFallbackTest(unittest.TestCase):
             for index in range(12):
                 (root / f"file{index}.txt").write_text(f"needle {index}\n", encoding="utf-8")
             (root / ".hidden.txt").write_text("needle hidden\n", encoding="utf-8")
-            tools = corvee.RepositoryTools(root, False, set())
+            tools = corvee.RepositoryTools(root, False)
             with without_ripgrep():
                 with patch.object(corvee, "GREP_BATCH_SIZE", 5):
                     calls: list[list[str]] = []
@@ -1393,7 +1408,7 @@ class GrepFallbackTest(unittest.TestCase):
             root = Path(inside).resolve()
             (root / "escape.txt").symlink_to(secret)
             (root / "real.txt").write_text("needle inside\n", encoding="utf-8")
-            tools = corvee.RepositoryTools(root, False, set())
+            tools = corvee.RepositoryTools(root, False)
             with without_ripgrep():
                 result = json.loads(tools.execute("search_text", {"pattern": "needle"}))
             self.assertTrue(result["ok"], result)
@@ -1428,21 +1443,11 @@ class ResumeAuthorityTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"mode": "write"', result.stderr)
 
-    def test_omitted_allow_command_list_is_restored(self) -> None:
-        result = self.resume({"write": False, "allowed_commands": ["echo"]}, [])
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('"echo"', result.stderr)
 
     def test_asking_for_write_on_a_read_only_run_is_still_refused(self) -> None:
         result = self.resume({"write": False, "allowed_commands": []}, ["--write"])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("original run was read-only", result.stderr)
-
-    def test_a_conflicting_command_list_is_still_refused(self) -> None:
-        result = self.resume({"write": False, "allowed_commands": ["echo"]},
-                             ["--allow-command", "git"])
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("differs from the original run", result.stderr)
 
 
 class FallbackListingTest(unittest.TestCase):
@@ -1457,7 +1462,7 @@ class FallbackListingTest(unittest.TestCase):
                 (objects / f"{index:040x}").write_text("x", encoding="utf-8")
             (root / "src").mkdir()
             (root / "src" / "main.py").write_text("print(1)\n", encoding="utf-8")
-            tools = corvee.RepositoryTools(root, False, set())
+            tools = corvee.RepositoryTools(root, False)
             with without_ripgrep():
                 result = json.loads(tools.execute("list_files", {}))
             self.assertTrue(result["ok"], result)
@@ -1471,7 +1476,7 @@ class FallbackListingTest(unittest.TestCase):
             root = Path(inside).resolve()
             (root / "escape.txt").symlink_to(secret)
             (root / "real.txt").write_text("public\n", encoding="utf-8")
-            tools = corvee.RepositoryTools(root, False, set())
+            tools = corvee.RepositoryTools(root, False)
             with without_ripgrep():
                 result = json.loads(tools.execute("list_files", {}))
             self.assertIn("real.txt", result["result"])
@@ -1632,7 +1637,7 @@ class AdversarialHardeningTest(unittest.TestCase):
         self.root = Path(self.directory.name).resolve()
         (self.root / "vendor" / "lib").mkdir(parents=True)
         (self.root / "src").mkdir()
-        self.tools = corvee.RepositoryTools(self.root, True, set())
+        self.tools = corvee.RepositoryTools(self.root, True)
 
     def test_nested_repository_git_directory_is_protected(self) -> None:
         # Submodules and vendored checkouts put a real .git well below the root.
@@ -1664,30 +1669,11 @@ class AdversarialHardeningTest(unittest.TestCase):
         ))
         self.assertTrue(result["ok"], result)
 
-    def test_git_configuration_flags_are_refused(self) -> None:
-        if shutil.which("git") is None:
-            self.skipTest("git is not installed")
-        tools = corvee.RepositoryTools(self.root, False, {"git"})
-        for argv in (
-            ["git", "-c", "core.pager=sh -c id", "status"],
-            ["git", "--exec-path=/tmp/evil", "status"],
-            ["git", "--config-env=core.pager=EVIL", "status"],
-        ):
-            with self.subTest(argv=argv):
-                result = json.loads(tools.execute("run_command", {"argv": argv}))
-                self.assertFalse(result["ok"], argv)
-                self.assertIn("not permitted", result["error"])
 
-    def test_ordinary_git_invocation_still_runs(self) -> None:
-        if shutil.which("git") is None:
-            self.skipTest("git is not installed")
-        tools = corvee.RepositoryTools(self.root, False, {"git"})
-        result = json.loads(tools.execute("run_command", {"argv": ["git", "--version"]}))
-        self.assertTrue(result["ok"], result)
 
     def test_grep_fallback_reports_relative_paths(self) -> None:
         (self.root / "src" / "hit.txt").write_text("needle\n", encoding="utf-8")
-        tools = corvee.RepositoryTools(self.root, False, set())
+        tools = corvee.RepositoryTools(self.root, False)
         with without_ripgrep():
             result = json.loads(tools.execute("search_text", {"pattern": "needle"}))
         self.assertTrue(result["ok"], result)
@@ -1764,7 +1750,7 @@ class WrapUpReserveTest(unittest.TestCase):
         return {"choices": [{"message": {"role": "assistant", "content": text}}]}
 
     def test_transient_failure_in_reserve_still_requests_a_report(self) -> None:
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         attempts = []
 
@@ -1786,7 +1772,7 @@ class WrapUpReserveTest(unittest.TestCase):
         self.assertIn("Return a concise partial", json.dumps(attempts[1]["messages"]))
 
     def test_wrap_up_failure_after_announcement_reports_transient_failure(self) -> None:
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
 
         def always_fail(method, endpoint, payload):
@@ -1956,7 +1942,7 @@ class StallGuardTest(unittest.TestCase):
     is not, and this test exists so nobody deletes it on that reasoning."""
 
     def test_stall_detected_mid_batch_stops_the_remaining_tool_calls(self) -> None:
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         call = {"function": {"name": "list_files", "arguments": "{}"}}
         batch = {"choices": [{"message": {
@@ -2001,7 +1987,7 @@ class WindowedReadTest(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name).resolve()
         (self.root / "big.log").write_text("line\n" * 45_000, encoding="utf-8")
-        self.tools = corvee.RepositoryTools(self.root, False, set())
+        self.tools = corvee.RepositoryTools(self.root, False)
 
     def test_a_file_larger_than_the_edit_limit_is_still_readable(self) -> None:
         self.assertGreater((self.root / "big.log").stat().st_size, corvee.MAX_EDIT_BYTES)
@@ -2035,7 +2021,7 @@ class WindowedReadTest(unittest.TestCase):
             root = Path(directory)
             (root / "big.txt").write_text("\n".join("x" * 200 for _ in range(400)),
                                           encoding="utf-8")
-            tools = corvee.RepositoryTools(root, False, set())
+            tools = corvee.RepositoryTools(root, False)
             body = json.loads(tools.execute("read_file", {"path": "big.txt",
                                                           "line_count": 1000}))["result"]
         self.assertLessEqual(len(body.encode("utf-8")), corvee.MAX_TOOL_OUTPUT)
@@ -2048,7 +2034,7 @@ class WindowedReadTest(unittest.TestCase):
             root = Path(directory)
             (root / "cjk.txt").write_text("\n".join("世" * 200 for _ in range(400)),
                                           encoding="utf-8")
-            tools = corvee.RepositoryTools(root, False, set())
+            tools = corvee.RepositoryTools(root, False)
             result = json.loads(tools.execute("read_file", {"path": "cjk.txt", "line_count": 1000}))
             self.assertTrue(result["ok"], result)
             body = result["result"]
@@ -2080,7 +2066,7 @@ class ListingCapTest(unittest.TestCase):
             root = Path(directory).resolve()
             for index in range(corvee.MAX_LIST_ENTRIES + 50):
                 (root / f"f{index}.txt").write_text("x", encoding="utf-8")
-            tools = corvee.RepositoryTools(root, False, set())
+            tools = corvee.RepositoryTools(root, False)
             with_rg = json.loads(tools.execute("list_files", {}))
             with without_ripgrep():
                 without_rg = json.loads(tools.execute("list_files", {}))
@@ -2133,7 +2119,7 @@ class UsageAccountingTest(unittest.TestCase):
         self.assertTrue(status["usage"]["reported_by_provider"])
 
     def test_run_steps_records_usage_from_the_provider(self) -> None:
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         response = {
             "choices": [{"message": {"role": "assistant", "content": "done"}}],
@@ -2235,7 +2221,7 @@ class DelegationEconomicsTest(unittest.TestCase):
             self.assertGreater(corvee.measure_diff(root), 0)
 
     def test_run_steps_counts_every_tool_result(self) -> None:
-        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
         call = {"id": "c1", "function": {"name": "list_files", "arguments": "{}"}}
         responses = [
