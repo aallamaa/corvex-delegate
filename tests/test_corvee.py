@@ -137,15 +137,17 @@ class CorveeTest(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def test_lists_models(self) -> None:
-        result = subprocess.run(
-            ["python3", str(SCRIPT), "--no-config", "--models"],
-            env=self.environment,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        self.assertEqual(result.stdout, "delegate-a\ndelegate-b\n")
+    def test_resolves_credentials_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mission = Path(directory) / "mission.md"
+            mission.write_text("inspect only", encoding="utf-8")
+            result = subprocess.run(
+                ["python3", str(SCRIPT), "--no-config", "--model", "delegate-a",
+                 "--mission", str(mission), "--cwd", directory, "--dry-run"],
+                env=self.environment, text=True, capture_output=True, check=True,
+            )
+        self.assertIn('"api_key_present": true', result.stderr)
+        self.assertIn(self.base_url, result.stderr)
         self.assertNotIn("test-secret", result.stdout + result.stderr)
 
     def test_public_cli_and_project_model_preserve_credential_path(self) -> None:
@@ -173,6 +175,7 @@ class CorveeTest(unittest.TestCase):
             env_file.write_text(
                 f"API_URL={self.base_url}\nAPI_KEY=file-secret\n", encoding="utf-8"
             )
+            (Path(directory) / "mission.md").write_text("inspect only", encoding="utf-8")
             clean_environment = {
                 key: value
                 for key, value in os.environ.items()
@@ -185,14 +188,21 @@ class CorveeTest(unittest.TestCase):
                     "--no-config",
                     "--env-file",
                     str(env_file),
-                    "--models",
+                    "--model",
+                    "delegate-a",
+                    "--mission",
+                    str(Path(directory) / "mission.md"),
+                    "--cwd",
+                    directory,
+                    "--dry-run",
                 ],
                 env=clean_environment,
                 text=True,
                 capture_output=True,
                 check=True,
             )
-            self.assertEqual(result.stdout, "delegate-a\ndelegate-b\n")
+            self.assertIn('"api_key_present": true', result.stderr)
+            self.assertIn(self.base_url, result.stderr)
             self.assertNotIn("file-secret", result.stdout + result.stderr)
 
     def test_model_config_selects_model_without_storing_a_secret(self) -> None:
@@ -315,7 +325,7 @@ class CorveeTest(unittest.TestCase):
                 if key not in {"CORVEX_API_KEY", "CORVEX_API_URL", "CORVEX_MODEL"}
             }
             listed = subprocess.run(
-                ["python3", str(SCRIPT), "--config", str(config), "--models"],
+                ["python3", str(CONFIGURE), "--config", str(config), "models"],
                 env=clean_environment,
                 text=True,
                 capture_output=True,
@@ -358,7 +368,7 @@ class CorveeTest(unittest.TestCase):
                 check=True,
             )
             shown = subprocess.run(
-                ["python3", str(CONFIGURE), "--config", str(config), "show"],
+                ["python3", str(CONFIGURE), "--config", str(config), "select"],
                 env=clean_environment,
                 text=True,
                 capture_output=True,
@@ -381,7 +391,7 @@ class CorveeTest(unittest.TestCase):
                 check=True,
             )
             shown_auto = subprocess.run(
-                ["python3", str(CONFIGURE), "--config", str(config), "show"],
+                ["python3", str(CONFIGURE), "--config", str(config), "select"],
                 env=clean_environment,
                 text=True,
                 capture_output=True,
@@ -665,7 +675,10 @@ class RunnerRecoveryTest(unittest.TestCase):
         with patch.object(client, "call", return_value=self.response("partial findings")) as call:
             result = corvee.run_steps(client, tools, [], "mock", None, 1, 100)
         self.assertEqual(result, 3)
-        self.assertEqual(call.call_args.args[2]["tool_choice"], "none")
+        # Wrap-up omits the schemas entirely; some servers emit tool calls
+        # anyway when definitions are present with tool_choice "none".
+        self.assertNotIn("tools", call.call_args.args[2])
+        self.assertNotIn("tool_choice", call.call_args.args[2])
 
     def test_disabled_tools_are_not_executed_during_wrapup(self):
         tools = corvee.RepositoryTools(Path.cwd(), False, set())
@@ -704,7 +717,10 @@ class RunnerRecoveryTest(unittest.TestCase):
             result = corvee.run_steps(client, tools, [], "mock", None, 20, 100)
         self.assertEqual(result, 3)
         self.assertEqual(execute.call_count, 3)
-        self.assertEqual(call.call_args.args[2]["tool_choice"], "none")
+        # Wrap-up omits the schemas entirely; some servers emit tool calls
+        # anyway when definitions are present with tool_choice "none".
+        self.assertNotIn("tools", call.call_args.args[2])
+        self.assertNotIn("tool_choice", call.call_args.args[2])
 
     def test_resume_checkpoint_trims_unmatched_tool_batch_and_preserves_context(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -863,7 +879,10 @@ class RunnerRecoveryTest(unittest.TestCase):
         times = iter([0, 85, 85, 85, 85, 85, 85])
         with patch.object(corvee.time, "monotonic", side_effect=lambda: next(times, 85)), patch.object(client, "call", return_value=self.response("partial")) as call:
             self.assertEqual(corvee.run_steps(client, tools, [], "mock", None, 10, 100), 3)
-        self.assertEqual(call.call_args.args[2]["tool_choice"], "none")
+        # Wrap-up omits the schemas entirely; some servers emit tool calls
+        # anyway when definitions are present with tool_choice "none".
+        self.assertNotIn("tools", call.call_args.args[2])
+        self.assertNotIn("tool_choice", call.call_args.args[2])
         self.assertLessEqual(client.timeout, 15)
 
 
@@ -1348,11 +1367,11 @@ class DurationOptionTest(unittest.TestCase):
     """--timeout accepts the same duration syntax on every subcommand."""
 
     def test_configure_commands_accept_suffixed_durations(self) -> None:
-        args = configure_corvee.parser().parse_args(["--timeout", "30m", "show"])
+        args = configure_corvee.parser().parse_args(["--timeout", "30m", "select"])
         self.assertEqual(args.timeout, 1800)
 
     def test_configure_commands_still_accept_plain_seconds(self) -> None:
-        args = configure_corvee.parser().parse_args(["--timeout", "45", "show"])
+        args = configure_corvee.parser().parse_args(["--timeout", "45", "select"])
         self.assertEqual(args.timeout, 45)
 
     def test_launcher_forwards_durations_to_check(self) -> None:
@@ -1557,6 +1576,135 @@ class NativeAgentMarkerTest(unittest.TestCase):
                     model="mock",
                     reasoning_effort="medium",
                 )
+
+
+class WrapUpReserveTest(unittest.TestCase):
+    """The time reserve exists to buy a partial report; a transient failure
+    inside it must not discard that chance."""
+
+    @staticmethod
+    def response(text):
+        return {"choices": [{"message": {"role": "assistant", "content": text}}]}
+
+    def test_transient_failure_in_reserve_still_requests_a_report(self) -> None:
+        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        client = corvee.ApiClient("https://example.com", "fake")
+        attempts = []
+
+        def call(method, endpoint, payload):
+            attempts.append(payload)
+            if len(attempts) == 1:
+                raise corvee.ProviderFailure("http_503", True)
+            return self.response("partial evidence")
+
+        # Step one starts inside the reserve window and fails retryably.
+        times = iter([0, 85, 85, 85, 85, 85, 85, 85, 85, 85])
+        with patch.object(corvee.time, "monotonic", side_effect=lambda: next(times, 85)):
+            with patch.object(client, "call", side_effect=call):
+                code = corvee.run_steps(client, tools, [], "mock", None, 10, 100)
+        self.assertEqual(code, 3)
+        # A second request was made, and it asked for a report with no tools.
+        self.assertEqual(len(attempts), 2)
+        self.assertNotIn("tools", attempts[1])
+        self.assertIn("Return a concise partial", json.dumps(attempts[1]["messages"]))
+
+    def test_wrap_up_failure_after_announcement_reports_transient_failure(self) -> None:
+        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        client = corvee.ApiClient("https://example.com", "fake")
+
+        def always_fail(method, endpoint, payload):
+            raise corvee.ProviderFailure("http_503", True)
+
+        times = iter([0, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85])
+        with patch.object(corvee.time, "monotonic", side_effect=lambda: next(times, 85)):
+            with patch.object(client, "call", side_effect=always_fail):
+                with self.assertRaises(SystemExit) as error:
+                    corvee.run_steps(client, tools, [], "mock", None, 10, 100)
+        # Retries are exhausted against a retryable status, which is exit 75,
+        # not budget exhaustion. Either way no report is claimed.
+        self.assertEqual(error.exception.code, 75)
+
+
+class RunStateProtectionTest(unittest.TestCase):
+    """Checkpoints hold repository content, so the default must be uncommitted."""
+
+    def test_creating_a_run_directory_writes_a_codex_gitignore(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / ".codex" / "corvee" / "reports" / "abc"
+            corvee._protect_run_state(run_dir)
+            marker = root / ".codex" / ".gitignore"
+            self.assertTrue(marker.is_file())
+            self.assertIn("corvee/reports/", marker.read_text(encoding="utf-8"))
+
+    def test_an_existing_gitignore_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".codex").mkdir()
+            marker = root / ".codex" / ".gitignore"
+            marker.write_text("mine\n", encoding="utf-8")
+            corvee._protect_run_state(root / ".codex" / "corvee" / "reports" / "abc")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "mine\n")
+
+    def test_a_custom_run_dir_outside_codex_is_not_touched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            corvee._protect_run_state(Path(directory) / "elsewhere" / "run")
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+
+class NativeAgentRemovalTest(unittest.TestCase):
+    """install-agent edits the user's own Codex config; it needs a way back."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.home = Path(self.directory.name)
+        self.config = self.home / "config.toml"
+        self.agent = self.home / "agents" / "corvee.toml"
+        self.agent.parent.mkdir(parents=True)
+
+    def test_removal_strips_the_block_and_keeps_user_settings(self) -> None:
+        import native_agent
+
+        self.config.write_text(
+            'model = "gpt-5"\n\n'
+            f"{native_agent.PROVIDER_BEGIN}\n"
+            '[model_providers.corvex]\nname = "Corvex"\n'
+            f"{native_agent.PROVIDER_END}\n",
+            encoding="utf-8",
+        )
+        self.agent.write_text('name = "corvee"\n', encoding="utf-8")
+        message = native_agent.remove_native_agent(self.config, self.agent)
+        remaining = self.config.read_text(encoding="utf-8")
+        self.assertIn('model = "gpt-5"', remaining)
+        self.assertNotIn("corvex", remaining)
+        self.assertFalse(self.agent.exists())
+        self.assertIn("Removed", message)
+        # What is left must still parse as TOML.
+        import tomllib
+
+        self.assertEqual(tomllib.loads(remaining), {"model": "gpt-5"})
+
+    def test_removal_is_idempotent(self) -> None:
+        import native_agent
+
+        self.config.write_text('model = "gpt-5"\n', encoding="utf-8")
+        message = native_agent.remove_native_agent(self.config, self.agent)
+        self.assertIn("Nothing to remove", message)
+
+    def test_install_then_remove_round_trips(self) -> None:
+        import native_agent
+
+        self.config.write_text('model = "gpt-5"\n', encoding="utf-8")
+        native_agent.install_native_agent(
+            codex_config=self.config, agent_file=self.agent,
+            credential_helper=Path("scripts/credential_helper.py"),
+            delegate_config=self.config, base_url="https://provider.example/v1",
+            model="mock", reasoning_effort="medium",
+        )
+        self.assertIn("corvex", self.config.read_text(encoding="utf-8"))
+        native_agent.remove_native_agent(self.config, self.agent)
+        self.assertEqual(self.config.read_text(encoding="utf-8").strip(), 'model = "gpt-5"')
 
 
 if __name__ == "__main__":

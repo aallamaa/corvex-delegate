@@ -59,9 +59,37 @@ All notable changes to this skill are recorded here. This project follows
 - Tool steps no longer write a full-history checkpoint twice in a row; the
   `response_received` snapshot was superseded by `tool_pending` immediately.
 
+### Changed
+
+- `install-agent` is reversible: `remove-agent` strips the managed provider
+  block from `~/.codex/config.toml` and deletes the custom-agent file. It was
+  previously a one-way edit to the user's own configuration.
+- Wrap-up requests omit the tool schemas instead of sending them with
+  `tool_choice: "none"`, which some OpenAI-compatible servers ignore.
+- The runner writes a `.codex/.gitignore` excluding `corvee/reports/` when it
+  first creates a run directory. Checkpoints embed repository content, and the
+  docs warned against publishing them while defaulting to a committable path.
+- `select` with no argument absorbed the identical `show` command.
+- Removed `run --models`, which duplicated the `models` subcommand and
+  overloaded `--model` as a substring filter.
+- A dotenv must name `CORVEX_MODEL`; the generic `MODEL` key is ignored.
+- `fail()` is defined once in `corvee_config`. The two SIGALRM deadline
+  managers and the two `atomic_write` variants are deliberately NOT unified:
+  `execution_deadline` must raise `SystemExit` so `except Exception` cannot
+  swallow it, and `RepositoryTools.atomic_write` preserves each file's mode so
+  delegate edits do not strip execute bits.
+
+### Fixed (runner)
+
+- A retryable provider failure inside the reporting reserve aborted with exit
+  124 before the wrap-up prompt was ever sent, discarding the partial report
+  the reserve exists to buy.
+
 ### Added
 
-- `scripts/corvee.py --version`.
+- `--version` on `scripts/corvee`, the documented entry point, as well as on
+  `scripts/corvee.py`.
+- `remove-agent` and its round-trip tests.
 - CI across Linux/macOS on Python 3.11-3.13, plus a `ruff` lint job.
 - Regression tests for write protection, the command environment allow-list,
   grep batching and its symlink boundary, and duration parsing.

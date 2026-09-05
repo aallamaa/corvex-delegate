@@ -13,13 +13,13 @@ Settings and credentials are separate files under `${CODEX_HOME:-~/.codex}/corve
 ## Models
 
 - `models [PATTERN]`: print exact live model IDs, optionally filtered.
-- `select` or `show`: show current non-secret settings.
+- `select` with no argument: show current non-secret settings.
 - `select MODEL_ID`: validate the ID against the catalog and save it.
 - `select auto`: clear the default locally without network access or credentials; do not automatically select another model.
 
-Mission model precedence: `--model`, project `--model-config DELEGATE.json`, `CORVEX_MODEL`/dotenv, user config. `DELEGATE.json` contains only `{"model": "exact-model-id"}`.
+Mission model precedence: `--model`, project `--model-config DELEGATE.json`, `CORVEX_MODEL` from the environment or a dotenv, then the user config. A dotenv must name `CORVEX_MODEL`; a bare `MODEL` is ignored because it collides with other tools' files. `DELEGATE.json` contains only `{"model": "exact-model-id"}`.
 
-The runner accepts temporary URL overrides through `--base-url`, `CORVEX_API_URL`, or dotenv `API_URL`. Only use an endpoint the user trusts with their key and repository content.
+The runner accepts temporary URL overrides through `--base-url` or `CORVEX_API_URL`. A dotenv may set the URL only when it also supplies the key, so a repository-local file cannot redirect an externally configured credential. Only use an endpoint the user trusts with their key and repository content.
 
 ## Failures
 

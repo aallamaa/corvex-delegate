@@ -23,6 +23,7 @@ from urllib import error, request
 
 from corvee_config import (
     ConfigError,
+    fail,
     DEFAULT_API_KEY_ENV,
     DEFAULT_BASE_URL,
     default_config_path,
@@ -78,6 +79,31 @@ class ProviderFailure(Exception):
     def __init__(self, category: str, retryable: bool = False):
         super().__init__(category)
         self.retryable = retryable
+
+
+def _protect_run_state(run_dir: Path) -> None:
+    """Keep checkpoints, which contain repository content, out of commits.
+
+    Run state is deliberately co-located with the repository so it travels with
+    the workspace and stays inspectable, but checkpoint.json embeds file
+    contents and tool output. Drop an ignore file at the .codex root the first
+    time a run directory is created so the default is "not committed".
+    """
+    for parent in run_dir.parents:
+        if parent.name == ".codex":
+            marker = parent / ".gitignore"
+            if not marker.exists():
+                try:
+                    parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_text(
+                        "# Written by corvee. Run artifacts embed repository content\n"
+                        "# and tool output; they are not meant to be committed.\n"
+                        "corvee/reports/\n",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass  # An unwritable .codex is the user's call, not a run failure.
+            return
 
 
 class RunJournal:
@@ -232,11 +258,6 @@ def _load_checkpoint_messages(
     if pending_trimmed and not messages_copy:
         fail(f"resume failed: checkpoint ends with an unterminated tool call in {checkpoint_path}")
     return messages_copy, next_step, phase, pending_trimmed, run_context
-
-
-def fail(message: str, code: int = 2) -> None:
-    print(message, file=sys.stderr)
-    raise SystemExit(code)
 
 
 def _get_report_dir_mtime(directory: Path) -> float:
@@ -889,7 +910,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Transient request retries (0-2); may incur duplicate inference charges")
     parser.add_argument("--run-dir", type=Path, help="New private artifact directory; must not exist")
     parser.add_argument("--resume", type=Path, help="Resume from an existing run directory")
-    parser.add_argument("--models", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--version", action="version", version=f"corvee {read_version()}")
     return parser
@@ -929,7 +949,6 @@ def main() -> int:
         or model_config_value
         or os.environ.get("CORVEX_MODEL")
         or env_file_values.get("CORVEX_MODEL")
-        or env_file_values.get("MODEL")
         or config.get("model")
         or ""
     )
@@ -972,20 +991,6 @@ def main() -> int:
             "scripts/corvee configure or set CORVEX_API_KEY."
         )
     client = ApiClient(base_url, api_key, timeout=args.http_timeout)
-
-    if args.models:
-        try:
-            response = client.call("GET", "/models")
-        except ProviderFailure as exc:
-            fail(f"Provider request failed: {exc}", 1)
-        models = response.get("data", []) if isinstance(response, dict) else []
-        ids = sorted(
-            item.get("id", "") for item in models if isinstance(item, dict) and item.get("id")
-        )
-        if args.model:
-            ids = [model_id for model_id in ids if args.model.lower() in model_id.lower()]
-        print("\n".join(ids))
-        return 0
 
     if not model:
         fail("Select a Corvex model with $corvee select or pass --model")
@@ -1094,6 +1099,7 @@ def main() -> int:
              " Verify repository state and continue from here with the existing evidence."}
         )
     directory = run_dir
+    _protect_run_state(directory)
     try:
         journal = RunJournal(directory, api_key, resume=bool(args.resume))
     except OSError as exc:
@@ -1170,12 +1176,13 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
                 "evidence report now, including uncertainties and unverified work. Do not claim completion."})
             event("wrap_up", reason=stop_reason)
             wrap_up_announced = True
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "tools": tools.schemas(),
-            "tool_choice": "none" if stop_reason else "auto",
-        }
+        payload: dict[str, Any] = {"model": model, "messages": messages}
+        if not stop_reason:
+            payload["tools"] = tools.schemas()
+            payload["tool_choice"] = "auto"
+        # During wrap-up the schemas are omitted rather than sent with
+        # tool_choice "none": some OpenAI-compatible servers still emit tool
+        # calls when the definitions are present, which costs the final report.
         if effort:
             payload["reasoning_effort"] = effort
         checkpoint("request_pending")
@@ -1208,7 +1215,10 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
                 event("request_retry", delay_seconds=delay)
                 time.sleep(delay)
         if response is None:
-            if stop_reason:
+            # The reserve exists to buy a partial report. Only give up once the
+            # wrap-up prompt has actually been sent and still produced nothing;
+            # otherwise fall through so the next step announces it.
+            if stop_reason and wrap_up_announced:
                 fail("delegate exceeded max time while waiting for final wrap-up", 124)
             continue
         if time.monotonic() - started >= max_time:

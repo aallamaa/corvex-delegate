@@ -7,13 +7,13 @@ import argparse
 import getpass
 import os
 from pathlib import Path
-import sys
 
 from corvee_config import (
     ConfigError,
     DEFAULT_API_KEY_ENV,
     DEFAULT_BASE_URL,
     default_config_path,
+    fail,
     fetch_models,
     get_codex_home,
     load_config,
@@ -26,12 +26,7 @@ from corvee_config import (
     write_configuration,
     verify_credential,
 )
-from native_agent import install_native_agent, native_agent_status
-
-
-def fail(message: str, code: int = 2) -> None:
-    print(message, file=sys.stderr)
-    raise SystemExit(code)
+from native_agent import install_native_agent, native_agent_status, remove_native_agent
 
 
 def parser() -> argparse.ArgumentParser:
@@ -69,8 +64,10 @@ def parser() -> argparse.ArgumentParser:
     agent.add_argument(
         "--reasoning-effort", choices=("minimal", "low", "medium", "high", "xhigh"), default="medium"
     )
+    commands.add_parser(
+        "remove-agent", help="remove the provider block and custom agent installed by install-agent"
+    )
     commands.add_parser("agent-status", help="show native provider and custom-agent status")
-    commands.add_parser("show", help="show non-secret settings")
     return result
 
 
@@ -163,12 +160,17 @@ def main() -> int:
             raise ConfigError("timeout must be positive")
         if args.command == "configure":
             return configure(args)
-        if args.command == "show" or (args.command == "select" and args.model is None):
+        if args.command == "select" and args.model is None:
             config = load_config(args.config, required=True)
             print(f"Configuration: {args.config}")
             print(f"API URL: {config.get('base_url') or DEFAULT_BASE_URL}")
             print(f"Model: {config.get('model') or 'not selected'}")
             print(f"Credential source: {config.get('api_key_env') or DEFAULT_API_KEY_ENV}, then protected file")
+            return 0
+        if args.command == "remove-agent":
+            print(remove_native_agent(
+                args.codex_config.expanduser().resolve(), args.agent_file.expanduser().resolve()
+            ))
             return 0
         if args.command == "agent-status":
             print(native_agent_status(args.codex_config, args.agent_file))

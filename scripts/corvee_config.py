@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import stat
 import signal
+import sys
 import time
 import tempfile
 import tomllib
@@ -31,6 +32,11 @@ CONFIG_FIELDS = {
 
 class ConfigError(RuntimeError):
     pass
+
+
+def fail(message: str, code: int = 2) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
 
 
 # signal.setitimer raises OverflowError well below this, and no legitimate run

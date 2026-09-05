@@ -19,12 +19,14 @@ The word after `$corvee` is a skill instruction, not a registered slash command:
 | `check` | Verify credentials with a tiny inference request |
 | `cleanup` | Remove stale run report directories |
 | `target GOAL` | Define outcome and acceptance gates |
-| `analyze` | Assess gaps and propose work units |
-| `refine` | Clarify the target and plan |
+| `analyze` | Assess gaps and propose work units; never edits `TARGET.md` |
+| `refine` | Revise `TARGET.md` itself: the only instruction that may |
 | `run` | Execute and verify one iteration |
 | `loop [CONDITION]` | Repeat within a bounded budget |
 | `audit` | Independently challenge completion |
 | `status` | Report progress and remaining gates |
+
+`analyze` and `refine` are deliberately separate: `analyze` treats the target as fixed and plans against it, while `refine` is the only instruction permitted to change gates. Keeping them apart is what stops a gate from being softened because a delegate failed it.
 
 Read [control-protocol.md](references/control-protocol.md) for target and execution operations. Read [provider-setup.md](references/provider-setup.md) for setup and model selection.
 

@@ -11,6 +11,8 @@ Use a durable control directory in the target repository:
 `-- reports/
 ```
 
+The runner writes a `.codex/.gitignore` that excludes `corvee/reports/` the first time it creates a run directory, because checkpoints embed repository content. `TARGET.md` and `STATE.md` are meant to be reviewed and may be committed.
+
 Create or update these files with normal Codex file-editing tools. Do not store API keys, authorization headers, full environment dumps, or secret-bearing provider configuration in them.
 
 ## Target contract
@@ -42,7 +44,7 @@ Maximum iterations and optional time or cost boundary.
 
 `STATE.md` records the current status, next unmet gate, iterations, delegate reports, primary-Codex verification, blockers, and target changes. Append iteration evidence; do not rewrite failed history into a success narrative.
 
-`DELEGATE.json` stores only the selected non-secret model ID:
+`DELEGATE.json` is the project-level model pin, distinct from the user-level default in `config.toml`, and stores only the selected non-secret model ID:
 
 ```json
 {"model": "exact-provider-model-id"}
@@ -55,7 +57,7 @@ Maximum iterations and optional time or cost boundary.
 Show current non-secret configuration and validate it, or configure Corvex from a safe credential source. Never request a key in chat. Use:
 
 ```bash
-python3 <skill-dir>/scripts/corvee show
+python3 <skill-dir>/scripts/corvee select
 python3 <skill-dir>/scripts/corvee check
 ```
 
@@ -64,6 +66,10 @@ If `CORVEX_API_KEY` or an explicitly identified dotenv file is available, run `s
 ### `check`
 
 Run `scripts/corvee check`. This makes a tiny billable inference request using the saved model, or the first catalog model solely for validation if no default is set. It does not change the model selection.
+
+### `cleanup`
+
+Remove stale run report directories with `scripts/corvee cleanup [--older-than-days N] [--dry-run]`. Reports accumulate one directory per run under `.codex/corvee/reports/` and hold repository content in `checkpoint.json`. Preview with `--dry-run` before deleting, and keep any run still referenced by an open gate in `STATE.md`.
 
 ### `target GOAL`
 
@@ -106,9 +112,9 @@ Request timeouts default to 600 seconds; retain that allowance for slow models u
 
 The final step/time reserve requests a tools-disabled report. Repeated identical results or consecutive tool errors trigger early wrap-up. Exit `3` is an incomplete report, `75` is exhausted transient retries, and `124` is budget exhaustion. None closes an acceptance gate. Inspect diagnostics before increasing limits or changing model/scope.
 
-### `loop [CONDITION] [--max-iterations N] [--max-time DURATION]`
+### `loop [CONDITION] [budget]`
 
-Repeat `run` until the explicit condition is independently verified. If no condition is supplied, use all acceptance gates in `TARGET.md`.
+Repeat `run` until the explicit condition is independently verified. A budget written after the instruction (for example "at most 6 iterations or 120 minutes") is prose for the planner to honour, not a parsed flag; only the runner's own `--max-time` and `--max-steps` reach the CLI. If no condition is supplied, use all acceptance gates in `TARGET.md`.
 
 Defaults are six iterations and 120 minutes for the current invocation unless `TARGET.md` specifies a lower budget. A user-supplied lower boundary wins. Never silently exceed an iteration, time, or stated cost budget.
 

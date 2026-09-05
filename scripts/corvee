@@ -29,12 +29,23 @@ def _normalize_timeout_aliases(values: list[str]) -> list[str]:
     return translated
 
 
+def read_version() -> str:
+    try:
+        return (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unknown"
+
+
 def main() -> int:
-    commands = {"configure", "models", "select", "show", "check"}
+    commands = {"configure", "models", "select", "check"}
+    if len(sys.argv) >= 2 and sys.argv[1] == "--version":
+        print(f"corvee {read_version()}")
+        return 0
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print("Usage: corvee COMMAND [OPTIONS]")
         print("Durations accept seconds or a 30s/30m/2h suffix.")
-        print("Commands: configure, models [PATTERN], select MODEL, show, check, cleanup, run")
+        print("Commands: configure, models [PATTERN], select [MODEL|auto], check, cleanup, run")
+        print("With no MODEL, 'select' prints the current non-secret settings.")
         print("For command help: corvee COMMAND --help")
         print("target, analyze, refine, loop, audit and status are Codex skill instructions;")
         print("invoke them in chat as: $corvee loop")

@@ -110,6 +110,41 @@ def install_native_agent(
     atomic_write(agent_file, _agent_config(model, reasoning_effort), 0o600)
 
 
+def remove_native_agent(codex_config: Path, agent_file: Path) -> str:
+    """Strip the managed provider block and custom-agent file installed earlier.
+
+    Without this, `install-agent` is a one-way door: it edits the user's own
+    ~/.codex/config.toml, and hand-editing TOML to undo it is exactly the kind
+    of step that leaves a broken provider behind.
+    """
+    removed = []
+    existing = codex_config.read_text(encoding="utf-8") if codex_config.exists() else ""
+    begin_count = existing.count(PROVIDER_BEGIN)
+    end_count = existing.count(PROVIDER_END)
+    if begin_count != end_count or begin_count > 1:
+        raise ConfigError("Codex config has malformed corvee provider markers; remove them by hand")
+    if begin_count == 1:
+        start = existing.index(PROVIDER_BEGIN)
+        end = existing.index(PROVIDER_END, start) + len(PROVIDER_END)
+        updated = existing[:start] + existing[end:]
+        # Collapse the blank run the removed block leaves behind.
+        while "\n\n\n" in updated:
+            updated = updated.replace("\n\n\n", "\n\n")
+        try:
+            tomllib.loads(updated)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"removing the provider block left invalid TOML: {exc}") from exc
+        mode = stat.S_IMODE(codex_config.stat().st_mode)
+        atomic_write(codex_config, updated.lstrip("\n"), mode)
+        removed.append(f"provider block in {codex_config}")
+    if agent_file.is_file():
+        agent_file.unlink()
+        removed.append(f"custom agent {agent_file}")
+    if not removed:
+        return "Nothing to remove: no managed provider block or custom agent found."
+    return "Removed " + "; ".join(removed) + "\nRestart Codex so it forgets the corvee agent."
+
+
 def native_agent_status(codex_config: Path, agent_file: Path) -> str:
     provider = False
     if codex_config.exists():

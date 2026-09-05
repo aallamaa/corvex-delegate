@@ -48,11 +48,11 @@ $corvee models
 $corvee select exact-provider-model-id
 $corvee target Make the service restart without losing queued jobs
 $corvee analyze
-$corvee loop --max-iterations 6 --max-time 120m
+$corvee loop until every gate passes, at most 6 iterations or 120 minutes
 $corvee status
 ```
 
-Other instructions: `check`, `refine`, `run` (one iteration), and `audit`. These are skill arguments, not slash commands. `select auto` clears the default rather than choosing a model automatically.
+Other instructions: `check`, `refine`, `run` (one iteration), and `audit`. These are skill arguments, not slash commands, and any budget written after `loop` is prose the planner interprets rather than parsed flags. `select auto` clears the default rather than choosing a model automatically.
 
 Codex maintains acceptance criteria, missions, and progress in `.codex/corvee/` in the target repository. A loop ends at independently verified completion or its budget/blocking boundary. Loops run in the active Codex session, not as a background service.
 
@@ -64,7 +64,7 @@ One public entry point handles setup and individual missions:
 python3 scripts/corvee configure
 python3 scripts/corvee models
 python3 scripts/corvee select exact-provider-model-id
-python3 scripts/corvee show
+python3 scripts/corvee select
 python3 scripts/corvee check
 python3 scripts/corvee cleanup --older-than-days 30
 python3 scripts/corvee run --mission /path/mission.md --cwd /path/repo --max-time 20m
@@ -101,7 +101,7 @@ An `--env-file` may override the API URL only when it also supplies the API key,
 
 ## Native agents
 
-The supported workflow uses the direct runner. Cross-provider native delegation failed in Codex CLI 0.153.2: an OpenAI parent spawned the custom role but the child retained OpenAI's provider. A separate Codex process configured for Corvex worked. Experimental helpers remain for investigation; normal installation does not install a native agent or modify the primary Codex provider. See [compatibility evidence](references/native-compatibility.md).
+The supported workflow uses the direct runner. Cross-provider native delegation failed in Codex CLI 0.153.2: an OpenAI parent spawned the custom role but the child retained OpenAI's provider. A separate Codex process configured for Corvex worked. Experimental helpers remain for investigation; normal installation does not install a native agent or modify the primary Codex provider. `install-agent` edits your own `~/.codex/config.toml`, so `configure_corvee.py remove-agent` undoes it: it strips the managed provider block, deletes the custom-agent file, and leaves the rest of your configuration intact. See [compatibility evidence](references/native-compatibility.md).
 
 ## Release checks
 
