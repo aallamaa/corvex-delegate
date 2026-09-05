@@ -1309,6 +1309,9 @@ class CommandEnvironmentTest(unittest.TestCase):
                 "AWS_SESSION": "leaked",
                 "GH_ENTERPRISE_HOST": "internal.example",
                 "CORVEX_API_URL": "https://provider.example/v1",
+                # With --write a delegate can drop a sitecustomize.py for any
+                # allow-listed interpreter to import.
+                "PYTHONPATH": "/tmp/attacker",
             }
             with patch.dict(os.environ, leaky):
                 result = json.loads(tools.execute("run_command", {"argv": ["env"]}))
@@ -1485,9 +1488,6 @@ class AdversarialHardeningTest(unittest.TestCase):
         tools = corvee.RepositoryTools(self.root, False, {"git"})
         result = json.loads(tools.execute("run_command", {"argv": ["git", "--version"]}))
         self.assertTrue(result["ok"], result)
-
-    def test_pythonpath_is_not_inherited_by_commands(self) -> None:
-        self.assertNotIn("PYTHONPATH", corvee.COMMAND_ENV_ALLOWLIST)
 
     def test_grep_fallback_reports_relative_paths(self) -> None:
         (self.root / "src" / "hit.txt").write_text("needle\n", encoding="utf-8")
@@ -1826,6 +1826,49 @@ class SharedTransportTest(unittest.TestCase):
                 with self.assertRaises(corvee_config.ConfigError):
                     corvee_config.fetch_models("https://provider.example/v1", "k", 9)
                 self.assertEqual(seen, [9])
+
+
+class StallGuardTest(unittest.TestCase):
+    """The stall detector fires mid-batch, so the rest of a stalled batch is
+    refused rather than executed. An audit called that branch unreachable; it
+    is not, and this test exists so nobody deletes it on that reasoning."""
+
+    def test_stall_detected_mid_batch_stops_the_remaining_tool_calls(self) -> None:
+        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        client = corvee.ApiClient("https://example.com", "fake")
+        call = {"function": {"name": "list_files", "arguments": "{}"}}
+        batch = {"choices": [{"message": {
+            "role": "assistant", "content": None,
+            "tool_calls": [dict(call, id=f"c{index}") for index in range(4)],
+        }}]}
+        executed = []
+        with patch.object(client, "call", return_value=batch):
+            with patch.object(tools, "execute",
+                              side_effect=lambda *a: executed.append(a) or '{"ok":true,"result":"same"}'):
+                corvee.run_steps(client, tools, [], "mock", None, 2, 100)
+        # Three identical results trip the stall guard; the fourth call in the
+        # same batch is answered with an error instead of being run.
+        self.assertEqual(len(executed), 3)
+
+    def test_permission_denied_directories_are_still_removed(self) -> None:
+        # A read-only directory needs its own mode relaxed before its children
+        # can be unlinked; chmod-ing the failing child is not enough.
+        with tempfile.TemporaryDirectory() as directory:
+            reports = Path(directory) / "reports"
+            stubborn = reports / "run"
+            stubborn.mkdir(parents=True)
+            (stubborn / "checkpoint.json").write_text("{}", encoding="utf-8")
+            old = time.time() - 60 * 60 * 24 * 60
+            os.utime(stubborn / "checkpoint.json", (old, old))
+            os.utime(stubborn, (old, old))
+            stubborn.chmod(0o500)
+            try:
+                summary = corvee.cleanup_reports(reports, older_than_days=30)
+            finally:
+                if stubborn.exists():
+                    stubborn.chmod(0o700)
+            self.assertEqual(summary["removed"], 1)
+            self.assertFalse(stubborn.exists())
 
 
 if __name__ == "__main__":

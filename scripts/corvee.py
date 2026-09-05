@@ -15,7 +15,6 @@ import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from typing import Any
@@ -185,7 +184,7 @@ def _load_checkpoint_messages(
         fail(f"resume failed: checkpoint contains malformed messages in {checkpoint_path}")
     if not messages:
         fail(f"resume failed: checkpoint has no messages in {checkpoint_path}")
-    if messages and messages[0].get("role") != "system":
+    if messages[0].get("role") != "system":
         fail(f"resume failed: checkpoint missing expected system prompt in {checkpoint_path}")
 
     raw_context = payload.get("run_context", {})
@@ -431,11 +430,11 @@ def execution_deadline(seconds: float):
                              previous_timer[1])
 
 
-def run_process(argv, *, timeout, check=False, capture_output=True, text=True, **kwargs):
-    """Terminate the command's process group on timeout or runner interruption."""
-    pipe = subprocess.PIPE if capture_output else None
-    with subprocess.Popen(argv, stdout=pipe, stderr=pipe,
-                          text=text, start_new_session=True, **kwargs) as process:
+def run_process(argv, *, timeout, **kwargs):
+    """Run a command with piped text output, killing its process group on
+    timeout or runner interruption. Callers inspect returncode themselves."""
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True, **kwargs) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except BaseException:
@@ -445,10 +444,7 @@ def run_process(argv, *, timeout, check=False, capture_output=True, text=True, *
                 pass
             process.wait()
             raise
-        result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
-        if check:
-            result.check_returncode()
-        return result
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
 class ApiClient:
@@ -651,12 +647,7 @@ class RepositoryTools:
         rg = shutil.which("rg")
         if rg:
             result = run_process(
-                [rg, "--files", "-g", glob],
-                cwd=self.root,
-                text=True,
-                capture_output=True,
-                timeout=30,
-                check=False,
+                [rg, "--files", "-g", glob], cwd=self.root, timeout=30
             )
             if result.returncode not in (0, 1):
                 raise ValueError(result.stderr.strip() or "rg --files failed")
@@ -677,11 +668,7 @@ class RepositoryTools:
             return self.grep_search(pattern, glob)
         result = run_process(
             [rg, "-n", "--no-heading", "--color", "never", "-g", glob, "-e", pattern, "--", "."],
-            cwd=self.root,
-            text=True,
-            capture_output=True,
-            timeout=30,
-            check=False,
+            cwd=self.root, timeout=30,
         )
         if result.returncode not in (0, 1):
             raise ValueError(result.stderr.strip() or "rg failed")
@@ -702,7 +689,7 @@ class RepositoryTools:
                 return True
             result = run_process(
                 [grep, "-nH", "-I", "-E", "-e", pattern, "--", *paths],
-                cwd=self.root, text=True, capture_output=True, timeout=GREP_BATCH_TIMEOUT,
+                cwd=self.root, timeout=GREP_BATCH_TIMEOUT,
             )
             if result.returncode not in (0, 1):
                 raise ValueError(result.stderr.strip() or "grep failed")
@@ -727,11 +714,10 @@ class RepositoryTools:
                 batch.append(os.path.join(".", relative))
                 if len(batch) >= GREP_BATCH_SIZE:
                     if not flush(batch):
-                        return truncate("".join(output))
+                        return "".join(output)
                     batch = []
-        if not flush(batch):
-            return truncate("".join(output))
-        return truncate("".join(output))
+        flush(batch)
+        return "".join(output)
 
     def tool_git_status(self) -> str:
         return self.fixed_command(["git", "status", "--short", "--branch"])
@@ -764,7 +750,7 @@ class RepositoryTools:
         replacement = original.replace(old_text, new_text)
         if len(replacement.encode("utf-8")) > MAX_FILE_BYTES:
             raise ValueError(f"replacement exceeds {MAX_FILE_BYTES} byte edit limit")
-        self.atomic_write(target, replacement)
+        protected_write(target, replacement, mode=None)
         return f"replaced {actual} occurrence(s) in {target.relative_to(self.root)}"
 
     def tool_write_file(self, path: str, content: str) -> str:
@@ -774,7 +760,7 @@ class RepositoryTools:
             raise ValueError(f"content exceeds {MAX_FILE_BYTES} byte write limit")
         target = self.safe_write_path(path, allow_missing=True)
         target.parent.mkdir(parents=True, exist_ok=True)
-        self.atomic_write(target, content)
+        protected_write(target, content, mode=None)
         return f"wrote {len(content.encode('utf-8'))} bytes to {target.relative_to(self.root)}"
 
     def tool_run_command(
@@ -808,10 +794,7 @@ class RepositoryTools:
         result = run_process(
             [executable, *argv[1:]],
             cwd=command_cwd,
-            text=True,
-            capture_output=True,
             timeout=timeout_seconds,
-            check=False,
             env=environment,
         )
         return (
@@ -821,32 +804,10 @@ class RepositoryTools:
         )
 
     def fixed_command(self, argv: list[str]) -> str:
-        result = run_process(
-            argv, cwd=self.root, text=True, capture_output=True, timeout=30, check=False
-        )
+        result = run_process(argv, cwd=self.root, timeout=30)
         if result.returncode != 0:
             raise ValueError(result.stderr.strip() or f"command failed: {' '.join(argv)}")
         return result.stdout
-
-    @staticmethod
-    def atomic_write(target: Path, content: str) -> None:
-        existing_mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
-        handle = tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=target.parent, delete=False
-        )
-        temporary = Path(handle.name)
-        try:
-            with handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            if existing_mode is not None:
-                temporary.chmod(existing_mode)
-            os.replace(temporary, target)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-
 
 def function_tool(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -1216,8 +1177,6 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
             # Tool steps checkpoint again as "tool_pending" before executing anything,
             # so a snapshot here would rewrite the whole history for nothing.
             checkpoint("response_received")
-
-        if not tool_calls:
             content = message.get("content")
             if not isinstance(content, str) or not content.strip():
                 fail("provider returned neither tool calls nor a final text report", 1)

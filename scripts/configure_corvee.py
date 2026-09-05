@@ -120,7 +120,6 @@ def configure(args: argparse.Namespace) -> int:
     selected = (
         args.model
         or env_values.get("CORVEX_MODEL")
-        or env_values.get("MODEL")
         or current.get("model")
         or None
     )

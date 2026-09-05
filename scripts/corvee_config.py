@@ -402,7 +402,15 @@ def probe_responses_api(base_url: str, api_key: str, model: str, timeout: int = 
         raise ConfigError("Corvex Responses API did not complete an SSE function call")
 
 
-def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
+def atomic_write(path: Path, content: str, mode: int | None = 0o600) -> None:
+    """Replace a file's contents atomically.
+
+    `mode` of None preserves the existing file's permissions, which is what
+    repository edits need: a delegate rewriting a script must not silently
+    strip its execute bit. A new file under None gets the process umask.
+    """
+    if mode is None and path.exists():
+        mode = stat.S_IMODE(path.stat().st_mode)
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=path.parent, delete=False
@@ -413,7 +421,8 @@ def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        temporary.chmod(mode)
+        if mode is not None:
+            temporary.chmod(mode)
         os.replace(temporary, path)
     finally:
         if temporary.exists():

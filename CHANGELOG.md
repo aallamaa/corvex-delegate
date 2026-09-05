@@ -61,6 +61,17 @@ All notable changes to this skill are recorded here. This project follows
 
 ### Changed
 
+- Dead parameters removed from `run_process`: `check` was never `True` and
+  `capture_output` never `False` at any of its five call sites, so both are
+  gone along with the redundant kwargs each caller repeated.
+- One `atomic_write`. The repository writer was a near-copy that existed only
+  to preserve file modes, which the shared one now does under `mode=None`.
+- The launcher imports `read_version` instead of carrying a second copy.
+- `configure` no longer honours a bare `MODEL` key in a dotenv. The runner and
+  `provider-setup.md` already rejected it; only this path still read it.
+- The grep fallback stopped truncating its own output, which `execute` does
+  anyway, and lost a pair of identical return branches.
+
 - Provider HTTP lives in one place. `corvee.py` and `corvee_config.py` each
   had their own urllib call plus its own `try/except` ladder — four ladders
   that had drifted apart, so the runner and the configuration commands could
