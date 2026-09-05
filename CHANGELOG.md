@@ -5,6 +5,47 @@ All notable changes to this skill are recorded here. This project follows
 
 ## [Unreleased]
 
+### Removed
+
+- The experimental native-Codex-subagent path is gone: `scripts/native_agent.py`,
+  `scripts/credential_helper.py`, `agents/openai.yaml`,
+  `references/native-compatibility.md`, `probe_responses_api`, and the
+  `check-responses` / `install-agent` / `remove-agent` / `agent-status`
+  subcommands. Its own recorded test said cross-provider spawn failed on Codex
+  CLI 0.153.2, so it was ~350 lines of code and three documentation sections
+  supporting a feature that did not work. The supported path is the direct
+  runner. Anyone who ran `install-agent` before this release should remove the
+  managed provider block from `~/.codex/config.toml` and delete
+  `~/.codex/agents/corvee.toml` by hand.
+
+### Fixed
+
+- The runner no longer echoes every journal event to stderr. The planner reads
+  this process's stderr as a tool result, so a 32-step run spent the planner
+  context the runner exists to save. Stderr now carries one line per run
+  boundary and per error; `events.jsonl` still holds the complete record, and
+  `--verbose` restores the old behavior.
+- `list_files` without ripgrep walked the tree with `rglob("*")`, descending
+  into `.git/` and following symlinks out of the repository. In any real
+  repository the 1000-entry cap was exhausted by loose objects before a source
+  file was reached. It now skips hidden entries and symlinks, matching the
+  search fallback and the behavior both `SKILL.md` and `README.md` already
+  claimed.
+- `--http-timeout` accepts `30s`/`30m`/`2h` like every other duration option;
+  it was `type=int` and crashed on a suffix that the README documented.
+- `--resume` restores the original run's `--write` mode and `--allow-command`
+  list from the checkpoint instead of failing and making the user reconstruct
+  them. A flag that conflicts with the checkpoint is still refused, so a resume
+  cannot silently widen or narrow a delegate's authority.
+
+### Changed
+
+- `SKILL.md` separates the six CLI-backed instructions from the six planning
+  steps that have no script behind them; the earlier single table presented all
+  twelve as if they were commands.
+- The delegation-economics argument is stated once, in `control-protocol.md`,
+  rather than restated in five places.
+
 ### Security
 
 - Write protection now rejects a `.git` component **anywhere** in the path and

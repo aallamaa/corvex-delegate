@@ -65,4 +65,4 @@ clean audit is not a passing gate.
 
 Keep the mission within the user's authorized scope. State known pre-existing changes so the delegate does not overwrite or misattribute them. For read-only missions, say explicitly that no repository edits are allowed.
 
-Delegate verification is advisory. The primary Codex agent reruns the gate command before closing a gate, and reads the change to the extent the gate does not cover it. A gate that is a command carries most of that weight; a gate that is a judgement leaves the reading to the planner.
+Delegate verification is advisory. The primary Codex agent reruns the gate command before closing a gate, and reads the change to the extent the gate does not cover it.

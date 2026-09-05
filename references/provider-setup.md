@@ -25,4 +25,4 @@ The runner accepts temporary URL overrides through `--base-url` or `CORVEX_API_U
 
 HTTP 401/403 indicates an authentication/access problem. HTTP 404 warrants checking the URL and `/v1` suffix. For unknown models use the live catalog without silently substituting. For unsupported reasoning effort omit `--effort`. Missing tool calls or malformed reports mean incomplete work. Authenticated requests refuse redirects; configure the intended endpoint directly.
 
-The runner uses `POST /chat/completions` with function tools. Optional Responses/native diagnostics are described in [native-compatibility.md](native-compatibility.md) and are not required.
+The runner uses `POST /chat/completions` with function tools.

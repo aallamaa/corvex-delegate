@@ -111,14 +111,12 @@ Execute exactly one controlled iteration:
 6. update `STATE.md` and stop after reporting the next state.
 
 Step 4 is not optional and is not delegable: the delegate's own claim that a
-check passed is evidence, not proof. Step 4 is also where planner cost is won:
-an exit code costs the same to check whether the delegate changed three files
-or three hundred, so the stronger the gate command, the less of step 5 is left
-to do. That is the lever, not avoiding the diff.
+check passed is evidence, not proof. The stronger the gate command, the less of
+step 5 is left to do.
 
 Use a fresh direct-runner context for each mission. A failed or timed-out run may have left partial edits; inspect before retrying. Capture the report and exit status in `reports/`. Do not include credential values or environment dumps.
 
-The runner creates a private per-run artifact directory automatically; use `--run-dir` to name a new directory explicitly. Read metadata in `events.jsonl` and `status.json` first. `checkpoint.json` preserves conversation/tool results and may contain private repository content. Inspect it locally as needed; do not paste it wholesale into chat or a new mission. Use `scripts/corvee run --resume <run-dir>` to continue from the latest checkpoint when safe, and keep `tool_pending` behavior conservative.
+The runner creates a private per-run artifact directory automatically; use `--run-dir` to name a new directory explicitly. Its stderr carries only run boundaries and errors, so read `status.json` for the outcome and `events.jsonl` for the full trace rather than passing `--verbose` by habit. `checkpoint.json` preserves conversation/tool results and may contain private repository content. Inspect it locally as needed; do not paste it wholesale into chat or a new mission. Use `scripts/corvee run --resume <run-dir>` to continue from the latest checkpoint when safe, and keep `tool_pending` behavior conservative. A resume reuses the original run's write mode and allowed commands; a conflicting flag is refused.
 
 Request timeouts default to 600 seconds; retain that allowance for slow models unless the user requests less. The total run budget still wins. A transient request can retry once (up to two with `--request-retries 2`), with possible duplicate provider charges, but completed local tools are not rerun. Do not restart an entire mission merely because one inference request timed out.
 
@@ -148,7 +146,7 @@ A timeout is not success. Partial progress remains recorded and the target stays
 
 Try to falsify the current completion claim. Use a fresh read-only delegate mission that receives the target, the change and the artifacts, but not the implementing delegate's conclusions. The primary Codex agent reruns the gate commands and reads the falsification report.
 
-`audit` is also the tool for a change too large to read. Delegating the reading is not free: specifying the mission costs the planner output tokens, which are the expensive kind, and the round trip costs wall-clock time. For an ordinary diff, reading it directly is cheaper than commissioning someone to read it. Reach for `audit` when a change is genuinely too large to read, or when independent falsification is worth paying for on its own merits, not as a routine substitute for looking at the work. Reopen any gate contradicted by stronger evidence.
+`audit` is also the tool for a change too large to read, but delegating a reading is not free: the mission costs planner output tokens to specify and a round trip to wait for. For an ordinary diff, read it directly. Reopen any gate contradicted by stronger evidence.
 
 ### `status`
 

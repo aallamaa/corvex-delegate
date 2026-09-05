@@ -7,13 +7,12 @@ import tarfile
 
 
 PACKAGE_FILES = (
-    "SKILL.md", "README.md", "CHANGELOG.md", "LICENSE", "VERSION", "agents/openai.yaml",
+    "SKILL.md", "README.md", "CHANGELOG.md", "LICENSE", "VERSION",
     "references/control-protocol.md", "references/mission-format.md",
-    "references/provider-setup.md", "references/native-compatibility.md",
+    "references/provider-setup.md",
     "scripts/corvee", "scripts/corvee.py",
     "scripts/corvee_config.py", "scripts/configure_corvee.py",
-    "scripts/install.py", "scripts/package.py", "scripts/native_agent.py",
-    "scripts/credential_helper.py",
+    "scripts/install.py", "scripts/package.py",
 )
 TEST_FILES = ("tests/test_corvee.py", "tests/fixtures/live_readonly_mission.md")
 # Development-only resources, listed explicitly so a drift check can tell a

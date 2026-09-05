@@ -1,4 +1,0 @@
-interface:
-  display_name: "Corvée"
-  short_description: "Coordinate bounded Corvex delegates"
-  default_prompt: "Use $corvee target to turn my goal into a measurable execution loop."

@@ -16,7 +16,13 @@ Thank you to **Corvex** for generously granting me alpha access to their APIs, w
 
 Python 3.11+, Git, ripgrep (`rg`) or `grep`, Codex with local skill support, and a Corvex API key. The Python runtime uses only the standard library. Linux and macOS are supported; the runner uses POSIX signals for wall-clock deadlines and does not support Windows.
 
-Search prefers ripgrep. The grep fallback uses extended regular expressions and filename/path globs, skips hidden entries and symlinks, and does not interpret `.gitignore`; use a sanitized checkout when ignored files contain private data.
+Search and file listing prefer ripgrep. Both fallbacks skip hidden entries and symlinks, use filename/path globs (the search fallback adds extended regular expressions), and do not interpret `.gitignore`; use a sanitized checkout when ignored files contain private data.
+
+### Other providers
+
+The skill is built and tested against Corvex, and that is the endpoint it defaults to. The runner itself speaks plain OpenAI-compatible `POST /chat/completions` with function tools, so any endpoint implementing that subset works: point `--base-url` (or `CORVEX_API_URL`) at it, supply its key through `CORVEX_API_KEY`, and pass one of its exact model IDs. `models` and `select` need a `GET /models` catalog; a provider without one still runs missions through an explicit `--model`.
+
+The URL must be HTTPS, except on loopback, so a local server (vLLM, Ollama, LM Studio) is reachable at `http://localhost:PORT/v1`. Only point it at an endpoint you trust with your key and your repository contents.
 
 ## Install
 
@@ -81,9 +87,11 @@ Inference requests default to a **600-second** socket timeout (`run --http-timeo
 
 `status.json` records the token usage the provider reported: `requests`, `prompt_tokens`, `completion_tokens`, `total_tokens`, and `reported_by_provider`. Per-request counts appear on `request_end` in `events.jsonl`. No prices are bundled, and a provider that returns no usage leaves `reported_by_provider` false, which means unmeasured rather than zero. Enforce spending through `--max-steps`, `--max-time`, and iteration budgets.
 
+The runner keeps its stderr short: one line per run boundary and per error. The complete event stream is always written to `events.jsonl`, and `--verbose` echoes it to stderr as well. Read `status.json` rather than scrolling the stream, so a long run does not consume the planner context this tool exists to save.
+
 Each non-dry run creates a new private directory under `.codex/corvee/reports/`, or at `--run-dir PATH` (which must not already exist). It contains metadata-only `events.jsonl`, `status.json`, `report.md`, and an atomic `checkpoint.json` with conversation and tool results. Directories are mode 0700 and files mode 0600. Checkpoints contain repository content: do not publish them or treat key redaction as a comprehensive secret scanner.
 
-To avoid redoing completed work after an interrupted or budget-exhausted run, use `--resume /path/to/run-dir` when rerunning. The runner restores the checkpointed conversation and continues from the next step while preserving prior tool outputs and avoiding duplicate re-execution.
+To avoid redoing completed work after an interrupted or budget-exhausted run, use `--resume /path/to/run-dir` when rerunning. The runner restores the checkpointed conversation and continues from the next step while preserving prior tool outputs and avoiding duplicate re-execution. It also restores the original run's `--write` mode and `--allow-command` list, so those flags need not be repeated; passing a flag that conflicts with the checkpoint is refused rather than silently changing the delegate's authority mid-run.
 
 One transient API retry is allowed by default; `--request-retries 0` disables retries and `2` is the maximum. Retries may incur duplicate inference charges, stay within the original time budget, and never replay completed local tools. Authentication errors and invalid JSON are not retried.
 
@@ -104,10 +112,6 @@ Even in `--write` mode, `write_file` and `replace_text` refuse `.git/` and `.cod
 Allow-listed commands run with a fixed environment allow-list (`PATH`, `HOME`, `TMPDIR`, locale, terminal); everything else, including `SSH_AUTH_SOCK`, `PYTHONPATH`, and `CORVEX_API_URL`, is stripped. Configuration flags that make an allow-listed binary run something else (`git -c`, `--config-env`, `--exec-path`, `ssh -o`, `rsync -e`) are refused. This narrows the blast radius but does not change the rule that allow-listing an interpreter, compiler, or build tool grants arbitrary code execution.
 
 An `--env-file` may override the API URL only when it also supplies the API key, so a repository-local `.env` cannot redirect an externally configured credential to another host.
-
-## Native agents
-
-The supported workflow uses the direct runner. Cross-provider native delegation failed in Codex CLI 0.153.2: an OpenAI parent spawned the custom role but the child retained OpenAI's provider. A separate Codex process configured for Corvex worked. Experimental helpers remain for investigation; normal installation does not install a native agent or modify the primary Codex provider. `install-agent` edits your own `~/.codex/config.toml`, so `configure_corvee.py remove-agent` undoes it: it strips the managed provider block, deletes the custom-agent file, and leaves the rest of your configuration intact. See [compatibility evidence](references/native-compatibility.md).
 
 ## Release checks
 

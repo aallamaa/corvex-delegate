@@ -149,6 +149,7 @@ class RunJournal:
             "diff_bytes": None,
         }
         self.diff_measurer: Any = None
+        self.verbose = False
     def record_tool_result(self, result: str) -> None:
         self.economics["delegate_tool_calls"] += 1
         self.economics["delegate_tool_bytes"] += len(result.encode("utf-8"))
@@ -183,7 +184,30 @@ class RunJournal:
         with self.events.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
             handle.flush()
-        print(line, file=sys.stderr, flush=True)
+        # The planner reads this process's stderr as a tool result, so the full
+        # event stream would spend the planner context this runner exists to
+        # save. Echo one short line per event by default; events.jsonl keeps
+        # the complete record either way.
+        if self.verbose:
+            print(line, file=sys.stderr, flush=True)
+        else:
+            summary = self.summarize(event, fields)
+            if summary is not None:
+                print(self.redact(summary), file=sys.stderr, flush=True)
+
+    @staticmethod
+    def summarize(event: str, fields: dict[str, Any]) -> str | None:
+        """One terse line for the events worth interrupting the planner over."""
+        if event in {"run_start", "run_resume", "run_end", "error", "request_error",
+                     "wrapup", "tools_disabled", "budget_warning"}:
+            detail = " ".join(f"{key}={value}" for key, value in fields.items()
+                              if key in {"status", "exit_code", "model", "max_steps",
+                                         "max_time_seconds", "start_step", "reason",
+                                         "message", "attempt"})
+            return f"[{event}] {detail}".rstrip()
+        if event == "tool_error":
+            return f"[tool_error] {fields.get('tool', '?')}: {fields.get('message', '')}"
+        return None
 
     def checkpoint(self, messages, phase: str):
         self.messages = messages
@@ -729,14 +753,21 @@ class RepositoryTools:
             if result.returncode not in (0, 1):
                 raise ValueError(result.stderr.strip() or "rg --files failed")
             return self.capped_listing(result.stdout.splitlines())
+        # Walk explicitly rather than rglob: a bare rglob descends into .git,
+        # whose loose objects exhaust MAX_LIST_ENTRIES before any source file
+        # is reached, and follows symlinks out of the repository.
         matches: list[str] = []
-        for path in self.root.rglob("*"):
-            if path.is_file():
-                relative = str(path.relative_to(self.root))
-                if fnmatch.fnmatch(relative, glob) or fnmatch.fnmatch(path.name, glob):
+        for directory, dirs, files in os.walk(self.root, followlinks=False):
+            dirs[:] = sorted(name for name in dirs if not name.startswith("."))
+            for name in sorted(files):
+                candidate = Path(directory) / name
+                if name.startswith(".") or candidate.is_symlink() or not candidate.is_file():
+                    continue
+                relative = str(candidate.relative_to(self.root))
+                if fnmatch.fnmatch(relative, glob) or fnmatch.fnmatch(name, glob):
                     matches.append(relative)
                     if len(matches) > MAX_LIST_ENTRIES:
-                        break
+                        return self.capped_listing(matches)
         return self.capped_listing(matches)
 
     @staticmethod
@@ -943,13 +974,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-command", action="append", default=[])
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--max-time", type=parse_duration)
-    parser.add_argument("--http-timeout", type=int, default=600,
-                        help="Per-request socket timeout in seconds (default: 600), capped by run budget")
+    parser.add_argument("--http-timeout", type=parse_duration, default=600,
+                        help="Per-request socket timeout, seconds or 30s/30m/2h (default: 600), capped by run budget")
     parser.add_argument("--request-retries", type=int, default=1,
                         help="Transient request retries (0-2); may incur duplicate inference charges")
     parser.add_argument("--run-dir", type=Path, help="New private artifact directory; must not exist")
     parser.add_argument("--resume", type=Path, help="Resume from an existing run directory")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Echo the full event stream to stderr instead of a summary line")
     parser.add_argument("--version", action="version", version=f"corvee {read_version()}")
     return parser
 
@@ -1080,11 +1113,21 @@ def main() -> int:
             start_step -= 1
         if "cwd" in resume_context and Path(resume_context["cwd"]).resolve() != root:
             fail("resume failed: checkpoint was started from a different --cwd; rerun with matching --cwd")
+        # Restore the authority the original run was granted rather than making
+        # the user reconstruct flags from checkpoint.json. Omitting a flag means
+        # "same as before"; passing a conflicting one is still an error, because
+        # silently widening or narrowing authority mid-run is worse than failing.
         if "write" in resume_context and resume_context["write"] != args.write:
-            fail("resume failed: resume used mismatched --write mode")
+            if args.write:
+                fail("resume failed: original run was read-only; rerun without --write")
+            args.write = True
         if "allowed_commands" in resume_context:
-            if sorted(set(args.allow_command)) != resume_context["allowed_commands"]:
-                fail("resume failed: resume used mismatched --allow-command list")
+            requested = sorted(set(args.allow_command))
+            if requested and requested != resume_context["allowed_commands"]:
+                fail("resume failed: --allow-command differs from the original run "
+                     f"({', '.join(resume_context['allowed_commands']) or 'none'}); "
+                     "omit the flag to reuse it")
+            args.allow_command = list(resume_context["allowed_commands"])
     else:
         try:
             mission_path = args.mission.resolve(strict=True)
@@ -1134,7 +1177,8 @@ def main() -> int:
     }
     if args.resume:
         run_description["resume_from"] = str(run_dir)
-    print(json.dumps(run_description, indent=2), file=sys.stderr)
+    if args.verbose or args.dry_run:
+        print(json.dumps(run_description, indent=2), file=sys.stderr)
     if args.dry_run:
         return 0
 
@@ -1152,6 +1196,7 @@ def main() -> int:
         if args.resume:
             fail(f"cannot open private run directory: {exc}")
         fail(f"cannot create private run directory: {exc}")
+    journal.verbose = args.verbose
     journal.diff_measurer = (lambda: measure_diff(root)) if args.write else (lambda: 0)
     print(f"Run artifacts: {directory}", file=sys.stderr, flush=True)
     journal.run_context = run_description["run_context"]

@@ -19,24 +19,18 @@ from corvee_config import (
     load_config,
     load_env_file,
     parse_duration,
-    probe_responses_api,
     resolve_api_key,
     update_selected_model,
     validate_base_url,
     write_configuration,
     verify_credential,
 )
-from native_agent import install_native_agent, native_agent_status, remove_native_agent
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     codex_home = get_codex_home()
     result.add_argument("--config", type=Path, default=default_config_path(codex_home))
-    result.add_argument("--codex-config", type=Path, default=codex_home / "config.toml")
-    result.add_argument(
-        "--agent-file", type=Path, default=codex_home / "agents" / "corvee.toml"
-    )
     result.add_argument("--timeout", type=parse_duration, default=600,
                         help="Request timeout; seconds or a 30s/30m/2h suffix (default: 600)")
     commands = result.add_subparsers(dest="command", required=True)
@@ -53,21 +47,6 @@ def parser() -> argparse.ArgumentParser:
     listing.add_argument("pattern", nargs="?")
     selection = commands.add_parser("select", help="save an exact live model ID")
     selection.add_argument("model", nargs="?")
-    responses = commands.add_parser(
-        "check-responses", help="validate Codex-compatible Responses SSE and function tools"
-    )
-    responses.add_argument("model", nargs="?")
-    agent = commands.add_parser(
-        "install-agent", help="EXPERIMENTAL: install provider/custom agent (cross-provider spawn failed on 0.153.2)"
-    )
-    agent.add_argument("model", nargs="?")
-    agent.add_argument(
-        "--reasoning-effort", choices=("minimal", "low", "medium", "high", "xhigh"), default="medium"
-    )
-    commands.add_parser(
-        "remove-agent", help="remove the provider block and custom agent installed by install-agent"
-    )
-    commands.add_parser("agent-status", help="show native provider and custom-agent status")
     return result
 
 
@@ -166,14 +145,6 @@ def main() -> int:
             print(f"Model: {config.get('model') or 'not selected'}")
             print(f"Credential source: {config.get('api_key_env') or DEFAULT_API_KEY_ENV}, then protected file")
             return 0
-        if args.command == "remove-agent":
-            print(remove_native_agent(
-                args.codex_config.expanduser().resolve(), args.agent_file.expanduser().resolve()
-            ))
-            return 0
-        if args.command == "agent-status":
-            print(native_agent_status(args.codex_config, args.agent_file))
-            return 0
         if args.command == "select" and args.model == "auto":
             update_selected_model(args.config, None)
             print("Cleared the default Corvex model")
@@ -190,32 +161,6 @@ def main() -> int:
         if args.command == "models":
             pattern = (args.pattern or "").lower()
             print("\n".join(model for model in models if pattern in model.lower()))
-            return 0
-        if args.command in {"check-responses", "install-agent"}:
-            model = args.model or config.get("model")
-            if not model:
-                raise ConfigError("select a Corvex model first or pass an exact model ID")
-            if model not in models:
-                raise ConfigError(f"model is not in the live catalog: {model}")
-            api_key = resolve_api_key(config, args.config)
-            probe_responses_api(base_url, api_key, str(model), args.timeout,
-                                reasoning_effort=getattr(args, "reasoning_effort", "medium"))
-            print(f"Corvex Responses API verified for {model}")
-            if args.command == "check-responses":
-                return 0
-            print("Experimental: cross-provider native subagents failed in Codex CLI 0.153.2; this only installs configuration.")
-            install_native_agent(
-                codex_config=args.codex_config.expanduser().resolve(),
-                agent_file=args.agent_file.expanduser().resolve(),
-                credential_helper=Path(__file__).with_name("credential_helper.py"),
-                delegate_config=args.config.expanduser().resolve(),
-                base_url=base_url,
-                model=str(model),
-                reasoning_effort=args.reasoning_effort,
-            )
-            print(f"Installed native Corvex provider in {args.codex_config}")
-            print(f"Installed native custom agent in {args.agent_file}")
-            print("Restart Codex so it discovers the corvee agent.")
             return 0
         if args.command == "select":
             if args.model not in models:
