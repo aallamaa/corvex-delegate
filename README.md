@@ -52,7 +52,7 @@ $corvee loop until every gate passes, at most 6 iterations or 120 minutes
 $corvee status
 ```
 
-Other instructions: `check`, `refine`, `run` (one iteration), and `audit`. These are skill arguments, not slash commands, and any budget written after `loop` is prose the planner interprets rather than parsed flags. `select auto` clears the default rather than choosing a model automatically.
+Other instructions: `check`, `refine`, `run` (one iteration), `audit`, and `cleanup`. These are skill arguments, not slash commands, and any budget written after `loop` is prose the planner interprets rather than parsed flags. `select auto` clears the default rather than choosing a model automatically.
 
 Codex maintains acceptance criteria, missions, and progress in `.codex/corvee/` in the target repository. A loop ends at independently verified completion or its budget/blocking boundary. Loops run in the active Codex session, not as a background service.
 
@@ -77,7 +77,7 @@ Use `COMMAND --help` for options. `--config PATH` selects another settings file.
 
 Inference requests default to a **600-second** socket timeout (`run --http-timeout`, or `--timeout` for configuration commands). Every duration option accepts plain seconds or a `30s`/`30m`/`2h` suffix. The runner's total `--max-time` remains a hard wall-clock boundary. Between requests it reserves up to 20% of the run budget for reporting, so a shorter run may cap an individual request below 600 seconds.
 
-`status.json` also records the economics of the trade: `delegate_tool_bytes` (what the delegate read) against `planner_review_bytes` (report plus diff, what Codex must read), and their ratio as `leverage`. The point of delegating is that the first number is large and the second stays small; leverage below 1 means the iteration cost more in Codex tokens than doing the work there directly would have. `diff_bytes` is null when it could not be measured, which is not the same as zero.
+`status.json` also records what the run cost on the delegate side: `delegate_tool_bytes` and `delegate_tool_calls` (what the delegate read), `mission_bytes`, `report_bytes`, and `diff_bytes` (working tree against `HEAD`, plus untracked files). The runner has no visibility into the planner's own token spend, which happens in another process, so it reports its own side and leaves the comparison to you. `diff_bytes` is null when it could not be measured, which is not the same as zero.
 
 `status.json` records the token usage the provider reported: `requests`, `prompt_tokens`, `completion_tokens`, `total_tokens`, and `reported_by_provider`. Per-request counts appear on `request_end` in `events.jsonl`. No prices are bundled, and a provider that returns no usage leaves `reported_by_provider` false, which means unmeasured rather than zero. Enforce spending through `--max-steps`, `--max-time`, and iteration budgets.
 

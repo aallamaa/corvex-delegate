@@ -68,9 +68,9 @@ All notable changes to this skill are recorded here. This project follows
     Checking an exit code costs the planner the same whether the delegate
     changed three files or three hundred; judging a change by reading it does
     not.
-  - A new `review` instruction delegates the reading of a large diff to a
-    fresh read-only mission and returns a short verdict. Rerunning the gate
-    command stays with the planner and is explicitly not delegable.
+  - Rerunning the gate command stays with the planner and is not delegable.
+    `audit` covers a change too large to read; it was briefly split into a
+    separate `review` instruction, which the same round then removed.
   - `analyze` now delegates repository exploration and drafting rather than
     requiring the planner to synthesise from its own reading. Exploration is
     the most token-heavy step in the loop.
@@ -78,11 +78,11 @@ All notable changes to this skill are recorded here. This project follows
     mission costs the planner a specification, a verdict and a ledger entry
     regardless of size, so splitting a well-specified change multiplies the
     expensive side of the trade. Split for ambiguity, not for size.
-- `status.json` carries an `economics` object making the trade checkable:
-  `delegate_tool_bytes` against `planner_review_bytes` (report plus diff), with
-  their ratio as `leverage`. Below 1 means the planner read more than the
-  delegate processed, so the iteration cost more than doing the work directly.
-  `diff_bytes` is null when unmeasurable, which is not zero.
+- `status.json` carries an `economics` object recording what the runner can
+  actually observe: `mission_bytes`, `delegate_tool_bytes`,
+  `delegate_tool_calls`, `report_bytes`, `diff_bytes`. `diff_bytes` measures
+  the tree against `HEAD` plus untracked files, is measured on interrupted and
+  failed runs too, and is null when unmeasurable, which is not zero.
 
 - Token usage is measured instead of demanded. The runner discarded the
   provider's `usage` payload while `control-protocol.md` told the planner to

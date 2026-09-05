@@ -136,9 +136,11 @@ class RunJournal:
         # report budget consumed, so the runner has to actually measure it.
         self.usage = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
                       "total_tokens": 0, "reported_by_provider": False}
-        # The point of delegating is that the delegate reads a lot so the
-        # planner reads a little. Record both sides so that ratio is visible
-        # instead of assumed.
+        # Facts about this run that the runner can actually observe. It cannot
+        # see what the planner reads -- that happens in another process -- so
+        # it records its own side and leaves the comparison to whoever has
+        # both halves. An earlier version divided these into a "leverage"
+        # ratio, which was wrong in both directions.
         self.economics = {
             "mission_bytes": 0,
             "delegate_tool_bytes": 0,
@@ -146,25 +148,10 @@ class RunJournal:
             "report_bytes": 0,
             "diff_bytes": None,
         }
+        self.diff_measurer: Any = None
     def record_tool_result(self, result: str) -> None:
         self.economics["delegate_tool_calls"] += 1
         self.economics["delegate_tool_bytes"] += len(result.encode("utf-8"))
-
-    def review_burden(self) -> dict[str, Any]:
-        """What the planner must read, against what the delegate absorbed.
-
-        Leverage below 1 means the planner reads more than the delegate
-        processed, which is the shape where delegating costs more than doing
-        the work directly.
-        """
-        economics = dict(self.economics)
-        planner_bytes = economics["report_bytes"] + (economics["diff_bytes"] or 0)
-        economics["planner_review_bytes"] = planner_bytes
-        economics["leverage"] = (
-            round(economics["delegate_tool_bytes"] / planner_bytes, 2)
-            if planner_bytes else None
-        )
-        return economics
 
     def record_usage(self, usage: Any) -> dict[str, int]:
         """Accumulate one response's token counts, ignoring absent or odd values.
@@ -219,9 +206,14 @@ class RunJournal:
         report_path = self.directory / "report.md"
         if report_path.exists():
             self.economics["report_bytes"] = report_path.stat().st_size
+        # A timed-out or interrupted run is exactly when someone wants to know
+        # what was left in the tree, so measure here rather than on the way out
+        # of a successful run.
+        if self.economics["diff_bytes"] is None and self.diff_measurer is not None:
+            self.economics["diff_bytes"] = self.diff_measurer()
         protected_write(self.directory / "status.json", json.dumps({
             "status": status, "exit_code": code, "step": self.step, "phase": self.phase,
-            "usage": self.usage, "economics": self.review_burden(),
+            "usage": self.usage, "economics": self.economics,
         }))
         self.event("run_end", status=status, exit_code=code)
         report = self.directory / "report.md"
@@ -1154,6 +1146,7 @@ def main() -> int:
         if args.resume:
             fail(f"cannot open private run directory: {exc}")
         fail(f"cannot create private run directory: {exc}")
+    journal.diff_measurer = (lambda: measure_diff(root)) if args.write else (lambda: 0)
     print(f"Run artifacts: {directory}", file=sys.stderr, flush=True)
     journal.run_context = run_description["run_context"]
     if args.resume and resume_context:
@@ -1186,7 +1179,6 @@ def main() -> int:
     except Exception:
         journal.finish("internal_error", 1)
         fail("Runner failed; inspect private run artifacts", 1)
-    journal.economics["diff_bytes"] = measure_diff(root) if args.write else 0
     journal.finish("report_returned" if code == 0 else "incomplete", code)
     return code
 
@@ -1201,12 +1193,28 @@ def measure_diff(root: Path) -> int | None:
     if git is None:
         return None
     try:
-        result = run_process([git, "diff"], cwd=root, timeout=30)
+        # Against HEAD, so staged work counts; a repository with no commits
+        # yet has no HEAD, so fall back to the working-tree diff.
+        result = run_process([git, "diff", "HEAD"], cwd=root, timeout=30)
+        if result.returncode != 0:
+            result = run_process([git, "diff"], cwd=root, timeout=30)
+        if result.returncode != 0:
+            return None
+        total = len(result.stdout.encode("utf-8"))
+        # Untracked files are invisible to git diff, so a mission that creates
+        # a new module would otherwise measure as no change at all.
+        listed = run_process(
+            [git, "ls-files", "--others", "--exclude-standard"], cwd=root, timeout=30
+        )
     except (OSError, subprocess.SubprocessError):
         return None
-    if result.returncode != 0:
-        return None
-    return len(result.stdout.encode("utf-8"))
+    if listed.returncode == 0:
+        for name in listed.stdout.splitlines():
+            try:
+                total += (root / name).stat().st_size
+            except OSError:
+                continue
+    return total
 
 
 def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,

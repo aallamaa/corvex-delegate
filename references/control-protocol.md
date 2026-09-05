@@ -86,7 +86,9 @@ Perform a read-only gap analysis against the current target:
 
 - map present state to each acceptance gate;
 - identify dependencies, risks, unknowns, and the critical path;
-- propose the smallest independently verifiable work units;
+- propose work units that are unambiguous rather than merely small: a unit is
+  the right size when its recipe is clear and its gate is one command, however
+  many files it touches;
 - distinguish facts from hypotheses;
 - update `STATE.md`, but do not edit product code.
 
@@ -94,7 +96,7 @@ Delegate the reading. A read-only delegate should gather the evidence and draft 
 
 ### `refine`
 
-Improve the target and route to it. Resolve vague gates, remove accidental scope, add missing invariants, split oversized work, and define stronger verification. Do not weaken a gate merely because a delegate failed it. Ask the user only when a choice materially changes scope or outcome.
+Improve the target and route to it. Resolve vague gates, remove accidental scope, add missing invariants, split work whose approach is still ambiguous, and define stronger verification. Do not weaken a gate merely because a delegate failed it. Ask the user only when a choice materially changes scope or outcome.
 
 ### `run`
 
@@ -104,15 +106,15 @@ Execute exactly one controlled iteration:
 2. create one bounded mission;
 3. run one delegate, or a small read-only fan-out for genuinely independent analysis;
 4. rerun the gate command yourself and read its exit code;
-5. read the change only to the extent the gate does not cover it. When the diff
-   is larger than roughly a screen, delegate the reading (see `review` below)
-   and read the reviewer's verdict instead;
+5. read the change to the extent the gate does not cover it, which for an
+   ordinary diff means reading it;
 6. update `STATE.md` and stop after reporting the next state.
 
 Step 4 is not optional and is not delegable: the delegate's own claim that a
-check passed is evidence, not proof. Step 5 is where planner cost is won or
-lost. Reading a whole diff makes the planner's spend grow with the delegate's
-output, which is the shape delegation exists to avoid.
+check passed is evidence, not proof. Step 4 is also where planner cost is won:
+an exit code costs the same to check whether the delegate changed three files
+or three hundred, so the stronger the gate command, the less of step 5 is left
+to do. That is the lever, not avoiding the diff.
 
 Use a fresh direct-runner context for each mission. A failed or timed-out run may have left partial edits; inspect before retrying. Capture the report and exit status in `reports/`. Do not include credential values or environment dumps.
 
@@ -142,22 +144,11 @@ After each iteration, reconsider the next unit from current evidence. Do not rep
 
 A timeout is not success. Partial progress remains recorded and the target stays incomplete.
 
-### `review`
-
-Delegate the reading of a change. Run a fresh read-only mission whose scope is
-the current diff and whose objective is to report, per hunk: what changed,
-whether it is inside the mission's authorised scope, anything unrelated that
-was touched, and any defect it can support with evidence. It receives the
-target and the diff but not the implementing delegate's report or conclusions.
-
-The planner then reads a verdict of a few hundred bytes rather than the diff
-itself, and still reruns the gate commands. Use it whenever the diff is large
-enough that reading it would dominate the iteration's planner cost. Do not use
-it to replace step 4, and do not treat a clean review as a passing gate.
-
 ### `audit`
 
-Try to falsify the current completion claim. Prefer a fresh read-only delegate mission that receives the target and artifacts but not the previous delegate's conclusions. The primary Codex agent reruns the gate commands and reads the falsification report, not the whole change. Reopen any gate contradicted by stronger evidence.
+Try to falsify the current completion claim. Use a fresh read-only delegate mission that receives the target, the change and the artifacts, but not the implementing delegate's conclusions. The primary Codex agent reruns the gate commands and reads the falsification report.
+
+`audit` is also the tool for a change too large to read. Delegating the reading is not free: specifying the mission costs the planner output tokens, which are the expensive kind, and the round trip costs wall-clock time. For an ordinary diff, reading it directly is cheaper than commissioning someone to read it. Reach for `audit` when a change is genuinely too large to read, or when independent falsification is worth paying for on its own merits, not as a routine substitute for looking at the work. Reopen any gate contradicted by stronger evidence.
 
 ### `status`
 

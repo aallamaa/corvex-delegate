@@ -1995,7 +1995,7 @@ class DelegationEconomicsTest(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.run_dir = Path(self.directory.name) / "run"
 
-    def test_leverage_is_delegate_reading_over_planner_reading(self) -> None:
+    def test_status_records_only_what_the_runner_can_observe(self) -> None:
         journal = corvee.RunJournal(self.run_dir, "secret")
         for _ in range(30):
             journal.record_tool_result("x" * 4_000)
@@ -2007,19 +2007,53 @@ class DelegationEconomicsTest(unittest.TestCase):
         )["economics"]
         self.assertEqual(economics["delegate_tool_bytes"], 120_000)
         self.assertEqual(economics["delegate_tool_calls"], 30)
-        self.assertEqual(economics["planner_review_bytes"], 2_100)
-        self.assertAlmostEqual(economics["leverage"], 57.14, places=1)
+        self.assertEqual(economics["report_bytes"], 900)
+        self.assertEqual(economics["diff_bytes"], 1_200)
+        # The planner runs in another process. A ratio against a number the
+        # runner cannot see was wrong in both directions and is gone.
+        self.assertNotIn("leverage", economics)
+        self.assertNotIn("planner_review_bytes", economics)
 
-    def test_a_verbose_report_on_little_work_shows_leverage_below_one(self) -> None:
+    def test_diff_is_measured_when_a_run_is_interrupted(self) -> None:
         journal = corvee.RunJournal(self.run_dir, "secret")
-        journal.record_tool_result("x" * 200)
-        (self.run_dir / "report.md").write_text("x" * 5_000, encoding="utf-8")
-        journal.economics["diff_bytes"] = 0
-        journal.finish("report_returned", 0)
+        journal.diff_measurer = lambda: 4_242
+        journal.finish("interrupted", 130)
         economics = json.loads(
             (self.run_dir / "status.json").read_text(encoding="utf-8")
         )["economics"]
-        self.assertLess(economics["leverage"], 1)
+        # A timed-out run is exactly when the tree's state matters most.
+        self.assertEqual(economics["diff_bytes"], 4_242)
+
+    def test_newly_created_files_count_as_change(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "-c", "user.email=t@e", "-c", "user.name=t",
+                            "commit", "-qm", "seed"], cwd=root, check=True)
+            self.assertEqual(corvee.measure_diff(root), 0)
+            # A delegate that creates a module has changed the tree, even
+            # though `git diff` alone reports nothing.
+            (root / "new_module.py").write_text("x" * 500, encoding="utf-8")
+            self.assertGreaterEqual(corvee.measure_diff(root), 500)
+
+    def test_staged_work_counts_as_change(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            tracked = root / "seed.txt"
+            tracked.write_text("seed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "-c", "user.email=t@e", "-c", "user.name=t",
+                            "commit", "-qm", "seed"], cwd=root, check=True)
+            tracked.write_text("changed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            self.assertGreater(corvee.measure_diff(root), 0)
 
     def test_an_unmeasurable_diff_is_null_rather_than_zero(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

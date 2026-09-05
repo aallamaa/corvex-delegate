@@ -22,14 +22,13 @@ The word after `$corvee` is a skill instruction, not a registered slash command:
 | `analyze` | Assess gaps and propose work units; never edits `TARGET.md` |
 | `refine` | Revise `TARGET.md` itself: the only instruction that may |
 | `run` | Execute and verify one iteration |
-| `review` | Delegate the reading of a diff and return a verdict |
 | `loop [CONDITION]` | Repeat within a bounded budget |
 | `audit` | Independently challenge completion |
 | `status` | Report progress and remaining gates |
 
 Write acceptance gates as commands wherever one exists. Checking an exit code costs the planner the same whether the delegate changed three files or three hundred; judging a change by reading it does not. Keeping the planner's verification cost flat as delegated volume grows is what makes the delegation pay.
 
-`status.json` reports the trade for each run: `economics.delegate_tool_bytes` against `economics.planner_review_bytes`, and their ratio as `economics.leverage`. Leverage below 1 means the planner read more than the delegate processed, which is the shape where doing the work directly would have been cheaper.
+`status.json` records what the run itself cost on the delegate side: `economics.delegate_tool_bytes`, `delegate_tool_calls`, `mission_bytes`, `report_bytes`, `diff_bytes`, and the provider's token counts under `usage`. The runner cannot see what the planner reads, so it does not guess: compare these against your own context growth to judge whether a task shape is worth delegating.
 
 `analyze` and `refine` are deliberately separate: `analyze` treats the target as fixed and plans against it, while `refine` is the only instruction permitted to change gates. Keeping them apart is what stops a gate from being softened because a delegate failed it.
 
@@ -61,7 +60,7 @@ Write tools additionally refuse `.git/` and `.codex/corvee/reports/` after symli
 
 Allowed executables are resolved at startup; delegate commands must use the exact authorized name or path. Search prefers `rg` and falls back to `grep` with extended regular expressions. The fallback skips hidden entries and symlinks but does not honor `.gitignore`, so ignored private files must be removed from shared checkouts. Linux/macOS wall-clock deadlines interrupt blocked requests and terminate active command process groups; deliberately detached processes are not sandboxed.
 
-After each run, capture the report and exit status, rerun the gate command yourself, and update the ledger with evidence. Rerunning the gate is not delegable. Reading the change is: when a diff is large, send a fresh read-only `review` mission and read its verdict instead of the diff, so what the planner reads stays flat as the delegate's output grows. Exit zero means a report was returned, not that the target passed. Timeouts and missing reports are incomplete work. Never weaken acceptance gates to obtain success.
+After each run, capture the report and exit status, rerun the gate command yourself, read the change, and update the ledger with evidence. Rerunning the gate is not delegable. For a change too large to read, `audit` sends a fresh read-only mission that reports on it, but delegating a reading costs planner output tokens to specify and a round trip to wait for, so it is worth it only when the change really is too big to read. Exit zero means a report was returned, not that the target passed. Timeouts and missing reports are incomplete work. Never weaken acceptance gates to obtain success.
 
 `--complexity` picks the step and time budget: `low` is 16 steps and 20 minutes, `medium` 32 and 60, `high` 48 and 120. Pass `--max-steps` or `--max-time` only to override one of them.
 
