@@ -1222,6 +1222,61 @@ class WriteProtectionTest(unittest.TestCase):
         self.assertTrue(result["ok"], result)
 
 
+class HistoryPruningTest(unittest.TestCase):
+    """Tool results are re-sent every turn, so the retained set is capped."""
+
+    @staticmethod
+    def conversation(sizes):
+        messages = [{"role": "system", "content": "s"}]
+        for index, size in enumerate(sizes):
+            messages.append({"role": "assistant", "content": None,
+                             "tool_calls": [{"id": f"c{index}", "type": "function",
+                                             "function": {"name": "read_file", "arguments": "{}"}}]})
+            messages.append({"role": "tool", "tool_call_id": f"c{index}", "content": "x" * size})
+        return messages
+
+    def test_nothing_is_pruned_below_the_budget(self) -> None:
+        messages = self.conversation([100, 100])
+        self.assertEqual(corvee.prune_tool_history(messages, budget=10_000), 0)
+        self.assertEqual([m["content"] for m in messages if m["role"] == "tool"],
+                         ["x" * 100] * 2)
+
+    def test_the_oldest_results_are_stubbed_first(self) -> None:
+        messages = self.conversation([5_000, 5_000, 5_000])
+        reclaimed = corvee.prune_tool_history(messages, budget=10_000)
+        tools = [m["content"] for m in messages if m["role"] == "tool"]
+        self.assertTrue(tools[0].startswith(corvee.PRUNED_MARKER), tools[0])
+        self.assertEqual(tools[1], "x" * 5_000, "newest results must survive intact")
+        self.assertEqual(tools[2], "x" * 5_000)
+        self.assertGreater(reclaimed, 4_000)
+
+    def test_pairing_survives_so_the_conversation_stays_valid(self) -> None:
+        messages = self.conversation([5_000, 5_000, 5_000])
+        corvee.prune_tool_history(messages, budget=1)
+        calls = [c["id"] for m in messages if m["role"] == "assistant"
+                 for c in m.get("tool_calls", [])]
+        answers = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
+        self.assertEqual(calls, answers, "every tool_call must keep its answer")
+        self.assertEqual(len(messages), 7)
+
+    def test_pruning_is_idempotent(self) -> None:
+        messages = self.conversation([5_000, 5_000, 5_000])
+        corvee.prune_tool_history(messages, budget=10_000)
+        snapshot = [m.get("content") for m in messages]
+        self.assertEqual(corvee.prune_tool_history(messages, budget=10_000), 0)
+        self.assertEqual([m.get("content") for m in messages], snapshot)
+
+    def test_a_pruned_conversation_still_reloads_from_a_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            messages = self.conversation([5_000, 5_000])
+            corvee.prune_tool_history(messages, budget=1)
+            journal = corvee.RunJournal(Path(directory) / "run", "")
+            journal.checkpoint(messages, "tool_completed")
+            loaded, _, _, trimmed, _ = corvee._load_checkpoint_messages(journal.directory)
+            self.assertFalse(trimmed, "pruned content must not look like a pending tool call")
+            self.assertEqual(len(loaded), len(messages))
+
+
 class RequestCommandTest(unittest.TestCase):
     """The delegate can ask for a command; it can never run one."""
 

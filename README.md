@@ -12,6 +12,51 @@ Includes model discovery, protected credential setup, persistent target tracking
 
 Thank you to **Corvex** for generously granting me alpha access to their APIs, which made it possible to build and test this skill.
 
+## Why a runner and not `codex exec`
+
+Codex can drive an OpenAI-compatible provider directly, so the obvious question
+is why this ships its own runner. The answer is measured, not assumed.
+
+Same mission, same model (`zai-org/GLM-5.2-FP8`), same repository, both
+producing a correct answer:
+
+| harness | mean input tokens | mean output | wall clock | cost/mission |
+| --- | --- | --- | --- | --- |
+| this runner | 35,734 | 1,563 | 13 s | **$0.031** |
+| `codex exec` | 96,559 | 3,079 | 25 s | $0.080 |
+
+`codex exec` sends a general-purpose system prompt and a full tool surface on
+every request. A delegate that only reads, searches and edits inside one
+repository does not need that, and the difference is billed on every turn: about
+**2.6x the tokens** for the same result. Codex reported ~90% cached input, but
+Corvex prices `input_cache_read` identically to `prompt`, so the cache buys
+latency rather than money.
+
+What `codex exec` gives you that this does not: a real OS sandbox, command
+execution with approval, and no harness to maintain. If those matter more than
+the token difference, use it -- the runner is not the only reasonable answer,
+just the cheaper one for bounded read-and-edit missions.
+
+The benchmark is `.codex/bench/` in this repository. Reproduce it before
+trusting the numbers; they are one mission on one model.
+
+### What the runner does to stay cheap
+
+- **The system prompt asks for frugality**, not thoroughness: search before
+  reading, read ranges rather than whole files, stop when the mission is
+  answered. Telling the model to *batch* tool calls instead was measured and
+  made things worse -- it read speculatively and doubled input tokens.
+- **Tool schemas are terse.** They are re-sent on every request, so
+  descriptions are trimmed to what changes behavior (~20% smaller).
+- **Tool-result history is capped.** Every result is re-sent on each later turn,
+  so an unbounded history costs quadratically. Past `MAX_HISTORY_TOOL_BYTES` the
+  oldest results become a stub telling the model to re-read if it still needs
+  them. Only the content changes: each `tool_call_id` keeps its answer, so the
+  conversation stays valid and still resumes.
+- **Line numbers are kept** in `read_file` output even though they cost roughly
+  two tokens a line, because audit missions cite them and every benchmark run
+  used them.
+
 ## Requirements
 
 Python 3.11+, Git, ripgrep (`rg`) or `grep`, Codex with local skill support, and a Corvex API key. The Python runtime uses only the standard library. Linux and macOS are supported; the runner uses POSIX signals for wall-clock deadlines and does not support Windows.

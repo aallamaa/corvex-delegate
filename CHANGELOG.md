@@ -5,6 +5,31 @@ All notable changes to this skill are recorded here. This project follows
 
 ## [Unreleased]
 
+### Changed
+
+- Token cost per mission cut by about a quarter, measured over eight runs of a
+  fixed mission against `zai-org/GLM-5.2-FP8`: mean input 46,302 -> 35,734,
+  median 42,504 -> 32,044, with answer quality unchanged (every run still named
+  all eight tools, quoted the gating condition and cited line numbers).
+  - The system prompt asks for frugality: search before reading, read ranges
+    rather than whole files, stop when the mission is answered. The opposite
+    instruction -- to batch independent tool calls, which the loop has always
+    supported -- was measured first and made things markedly worse (input
+    tokens roughly doubled, to 51,056) because the model read speculatively.
+    That is why the prompt says what it says.
+  - Tool schema descriptions trimmed to what changes behavior, and the
+    `additionalProperties` / `minimum` / `maximum` fields dropped, since the
+    runtime enforces those bounds anyway. Read-only schema 2,036 -> 1,627
+    characters, write 2,784 -> 2,313; that is re-sent on every request.
+  - `prune_tool_history` caps retained tool results at `MAX_HISTORY_TOOL_BYTES`.
+    Every result is re-sent on each later turn, so history costs quadratically
+    and one greedy listing early in a run is billed again on every turn after
+    it. Past the budget the oldest results become a stub inviting a re-read.
+    Only `content` changes, so every `tool_call_id` keeps its answer and a
+    pruned conversation still resumes from its checkpoint.
+- README documents why the runner exists rather than `codex exec`, with the
+  benchmark behind it and the reproduction recipe in `.codex/bench/`.
+
 ### Fixed
 
 - Report cleanup failed on Python 3.11, so CI had been red on that leg for ten

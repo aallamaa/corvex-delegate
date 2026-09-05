@@ -52,6 +52,13 @@ MAX_LIST_ENTRIES = 1_000
 # expected to run the command and resume with --command-result.
 EXIT_COMMAND_REQUESTED = 65
 MAX_COMMAND_RESULT_BYTES = 100_000
+# Every tool result is re-sent on every later request, so an unbounded history
+# costs quadratically: one greedy listing early in a run is billed again on each
+# subsequent turn. Past this budget the oldest results are replaced by a stub
+# naming what they held, so the model can re-read deliberately if it still needs
+# them. Only the content changes -- the tool_call_id pairing the protocol
+# requires, and that resume validates, is preserved.
+MAX_HISTORY_TOOL_BYTES = 40_000
 
 # A deny-list cannot keep pace with credential-bearing variable names, and it
 # leaks channels such as SSH_AUTH_SOCK that carry no secret in the name itself.
@@ -68,12 +75,12 @@ GREP_TOTAL_TIMEOUT = 120
 SUMMARIZED_EVENTS = frozenset({
     "run_start", "run_resume", "run_end",
     "request_error", "request_retry",
-    "wrap_up", "wrap_up_rejected",
+    "wrap_up", "wrap_up_rejected", "history_pruned",
     "stall_warning", "stall_detected",
 })
 SUMMARY_FIELDS = frozenset({
     "status", "exit_code", "model", "max_steps", "max_time_seconds", "start_step",
-    "reason", "category", "retryable", "delay_seconds", "from_phase",
+    "reason", "category", "retryable", "delay_seconds", "from_phase", "reclaimed_bytes",
 })
 
 # Repository-internal paths a delegate must never write, even in --write mode.
@@ -82,6 +89,7 @@ SUMMARY_FIELDS = frozenset({
 # checkouts, submodules and worktrees put real git directories well below the
 # root, so this cannot be anchored at position 0. Matching is case-insensitive
 # because APFS and NTFS resolve ".GIT" to the same directory.
+PRUNED_MARKER = "[pruned]"
 PROTECTED_WRITE_COMPONENTS = frozenset({".git"})
 # The run's own evidence tree, anchored at the repository root.
 PROTECTED_WRITE_PREFIXES = (
@@ -602,25 +610,23 @@ class RepositoryTools:
         tools = [
             function_tool(
                 "read_file",
-                "Read a UTF-8 text file inside the repository with line numbers.",
+                "Read a file with line numbers. Prefer a narrow start_line/line_count window.",
                 {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"},
-                        "start_line": {"type": "integer", "minimum": 1},
-                        "line_count": {"type": "integer", "minimum": 1, "maximum": 1000},
+                        "start_line": {"type": "integer"},
+                        "line_count": {"type": "integer"},
                     },
                     "required": ["path"],
-                    "additionalProperties": False,
                 },
             ),
             function_tool(
                 "list_files",
-                "List repository files, optionally filtered by a glob.",
+                "List repository files. Always pass a glob; a bare listing is large.",
                 {
                     "type": "object",
                     "properties": {"glob": {"type": "string"}},
-                    "additionalProperties": False,
                 },
             ),
             function_tool(
@@ -633,7 +639,6 @@ class RepositoryTools:
                         "glob": {"type": "string"},
                     },
                     "required": ["pattern"],
-                    "additionalProperties": False,
                 },
             ),
             function_tool(
@@ -643,11 +648,10 @@ class RepositoryTools:
             ),
             function_tool(
                 "git_diff",
-                "Show the current unstaged git diff, optionally for one repository path.",
+                "Show the unstaged git diff, optionally for one path.",
                 {
                     "type": "object",
                     "properties": {"path": {"type": "string"}},
-                    "additionalProperties": False,
                 },
             ),
         ]
@@ -670,8 +674,7 @@ class RepositoryTools:
                                 },
                             },
                             "required": ["path", "old_text", "new_text"],
-                            "additionalProperties": False,
-                        },
+                                },
                     ),
                     function_tool(
                         "write_file",
@@ -683,33 +686,28 @@ class RepositoryTools:
                                 "content": {"type": "string"},
                             },
                             "required": ["path", "content"],
-                            "additionalProperties": False,
-                        },
+                                },
                     ),
                 ]
             )
         tools.append(
             function_tool(
                 "request_command",
-                "Ask the planner to run one command and return its output. This does "
-                "NOT execute anything: the run stops, the planner decides whether to "
-                "run it, and resumes you with the result. Use it only when the answer "
-                "cannot be read from the repository, and expect a delay.",
+                "Ask the planner to run a command. Executes nothing: the run stops "
+                "until the planner returns the output. Costly -- use only when the "
+                "repository cannot answer the question.",
                 {
                     "type": "object",
                     "properties": {
                         "argv": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Command and arguments, unquoted, as a list.",
                         },
                         "reason": {
                             "type": "string",
-                            "description": "What this command answers that reading cannot.",
                         },
                     },
                     "required": ["argv", "reason"],
-                    "additionalProperties": False,
                 },
             )
         )
@@ -1174,17 +1172,24 @@ def main() -> int:
             fail(f"mission exceeds {MAX_MISSION_BYTES} bytes")
         mission = mission_path.read_text(encoding="utf-8")
         mission_bytes = mission_path.stat().st_size
+        # Every request re-sends this, so it earns its length. Measured against
+        # the benchmark in .codex/bench: telling the model to batch tool calls
+        # made it read speculatively and doubled input tokens, so the guidance
+        # is frugality instead. The scope limits stay because request_command
+        # lets the delegate ask for any command, including a push.
         system = (
-            "You are a bounded repository delegate. Execute only the supplied mission. "
-            "Use tools to inspect evidence before conclusions. Do not expand scope, access credentials, "
-            "commit, push, release, or perform production operations. "
+            "You are a bounded repository delegate. Execute only the supplied mission, "
+            "inspecting evidence with tools before drawing conclusions. "
+            "Be frugal: search before reading, read only the ranges you need rather than "
+            "whole files, and stop gathering evidence as soon as the mission can be answered. "
+            "Every tool result stays in context and is re-sent on each later turn. "
+            "Do not expand scope, access credentials, commit, push, or release. "
             + (
                 "Repository writes are authorized only within the mission scope. "
                 if args.write
-                else "This is read-only: do not request or claim repository edits. "
+                else "This is read-only. "
             )
-            + "Finish with a concise evidence report listing files changed, checks performed, failures, "
-            "uncertainties, and whether the bounded objective is complete."
+            + "Finish with the evidence report the mission asks for."
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system},
@@ -1309,6 +1314,35 @@ def measure_diff(root: Path) -> int | None:
     return total
 
 
+def prune_tool_history(messages: list[dict[str, Any]],
+                       budget: int = MAX_HISTORY_TOOL_BYTES) -> int:
+    """Stub out the oldest tool results once the retained set exceeds `budget`.
+
+    Walks newest-first so recent evidence survives intact; returns the number of
+    bytes reclaimed. Rewriting `content` keeps every assistant tool_call paired
+    with its tool message, which is what both the provider protocol and
+    _load_checkpoint_messages require.
+    """
+    kept = 0
+    reclaimed = 0
+    for message in reversed(messages):
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content") or ""
+        if content.startswith(PRUNED_MARKER):
+            continue
+        size = len(content.encode("utf-8"))
+        if kept + size <= budget:
+            kept += size
+            continue
+        message["content"] = (
+            f"{PRUNED_MARKER} {size} bytes of an earlier tool result were dropped to "
+            "bound context growth. Call the tool again if you still need them."
+        )
+        reclaimed += size - len(message["content"].encode("utf-8"))
+    return reclaimed
+
+
 def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
               journal=None, request_retries=1, start_step=1):
     started = time.monotonic()
@@ -1344,6 +1378,9 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
                 "evidence report now, including uncertainties and unverified work. Do not claim completion."})
             event("wrap_up", reason=stop_reason)
             wrap_up_announced = True
+        reclaimed = prune_tool_history(messages)
+        if reclaimed:
+            event("history_pruned", reclaimed_bytes=reclaimed)
         payload: dict[str, Any] = {"model": model, "messages": messages}
         if not stop_reason:
             payload["tools"] = tools.schemas()
