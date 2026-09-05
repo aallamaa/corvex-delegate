@@ -28,6 +28,7 @@ from corvee_config import (
     default_config_path,
     load_config,
     load_env_file,
+    parse_duration,
     resolve_api_key,
     validate_base_url,
     open_request,
@@ -37,6 +38,40 @@ from corvee_config import (
 
 MAX_FILE_BYTES = 200_000
 MAX_TOOL_OUTPUT = 30_000
+
+# A deny-list cannot keep pace with credential-bearing variable names, and it
+# leaks channels such as SSH_AUTH_SOCK that carry no secret in the name itself.
+# grep fallback batching: one process per chunk of files, not per file.
+GREP_BATCH_SIZE = 256
+GREP_BATCH_TIMEOUT = 60
+
+COMMAND_ENV_ALLOWLIST = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR",
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
+    "PYTHONDONTWRITEBYTECODE",
+})
+# PYTHONPATH is deliberately absent: combined with --write it lets a delegate
+# drop a sitecustomize.py and have any allow-listed interpreter import it.
+
+# Flags that turn a benign-looking allow-listed binary into arbitrary
+# execution by pointing it at a model-supplied configuration or hook.
+COMMAND_ARGUMENT_DENYLIST = {
+    "git": ("-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack"),
+    "ssh": ("-o", "-F"),
+    "rsync": ("-e", "--rsh"),
+}
+
+# Repository-internal paths a delegate must never write, even in --write mode.
+# A ".git" component anywhere grants code execution through hooks or
+# core.sshCommand on the next git operation in THAT repository -- vendored
+# checkouts, submodules and worktrees put real git directories well below the
+# root, so this cannot be anchored at position 0. Matching is case-insensitive
+# because APFS and NTFS resolve ".GIT" to the same directory.
+PROTECTED_WRITE_COMPONENTS = frozenset({".git"})
+# The run's own evidence tree, anchored at the repository root.
+PROTECTED_WRITE_PREFIXES = (
+    (".codex", "corvee", "reports"),
+)
 
 
 class ProviderFailure(Exception):
@@ -204,22 +239,6 @@ def fail(message: str, code: int = 2) -> None:
     raise SystemExit(code)
 
 
-def parse_duration(value: str) -> int:
-    if not value:
-        raise argparse.ArgumentTypeError("duration cannot be empty")
-    suffix = value[-1]
-    multipliers = {"s": 1, "m": 60, "h": 3600}
-    if suffix in multipliers:
-        number = value[:-1]
-        multiplier = multipliers[suffix]
-    else:
-        number = value
-        multiplier = 1
-    if not number.isdigit() or int(number) < 1:
-        raise argparse.ArgumentTypeError("expected a positive duration such as 30m")
-    return int(number) * multiplier
-
-
 def _get_report_dir_mtime(directory: Path) -> float:
     latest = directory.stat().st_mtime
     try:
@@ -237,6 +256,7 @@ def _get_report_dir_mtime(directory: Path) -> float:
     return latest
 
 
+MAX_REMOVE_DEPTH = 64
 KNOWN_REPORT_ARTIFACTS = {"checkpoint.json", "events.jsonl", "status.json", "report.md"}
 
 
@@ -259,7 +279,9 @@ def _is_report_candidate(entry: Path) -> bool:
     return False
 
 
-def _force_remove_tree(path: Path) -> None:
+def _force_remove_tree(path: Path, depth: int = 0) -> None:
+    if depth > MAX_REMOVE_DEPTH:
+        raise OSError(f"report tree exceeds {MAX_REMOVE_DEPTH} levels; refusing to recurse: {path}")
     path = Path(path)
     try:
         st = path.lstat()
@@ -279,7 +301,7 @@ def _force_remove_tree(path: Path) -> None:
     except OSError:
         pass
     for child in entries:
-        _force_remove_tree(child)
+        _force_remove_tree(child, depth + 1)
     os.rmdir(path)
 
 
@@ -395,7 +417,8 @@ def execution_deadline(seconds: float):
 
 def run_process(argv, *, timeout, check=False, capture_output=True, text=True, **kwargs):
     """Terminate the command's process group on timeout or runner interruption."""
-    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    pipe = subprocess.PIPE if capture_output else None
+    with subprocess.Popen(argv, stdout=pipe, stderr=pipe,
                           text=text, start_new_session=True, **kwargs) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
@@ -466,7 +489,25 @@ class RepositoryTools:
         try:
             resolved.relative_to(self.root)
         except ValueError:
-            raise ValueError(f"path is outside repository root: {value}")
+            raise ValueError(f"path is outside repository root: {value}") from None
+        return resolved
+
+    def safe_write_path(self, value: str, *, allow_missing: bool = False) -> Path:
+        """Confine writes to the repository and refuse protected internal paths."""
+        resolved = self.safe_path(value, allow_missing=allow_missing)
+        parts = resolved.relative_to(self.root).parts
+        folded = tuple(part.lower() for part in parts)
+        for index, part in enumerate(folded):
+            if part in PROTECTED_WRITE_COMPONENTS:
+                raise ValueError(
+                    f"path is write-protected: {'/'.join(parts[: index + 1])} "
+                    "is a git directory and may not be modified by a delegate"
+                )
+        for prefix in PROTECTED_WRITE_PREFIXES:
+            if folded[: len(prefix)] == prefix:
+                raise ValueError(
+                    f"path is write-protected: {'/'.join(prefix)} may not be modified by a delegate"
+                )
         return resolved
 
     def schemas(self) -> list[dict[str, Any]]:
@@ -654,8 +695,25 @@ class RepositoryTools:
         grep = shutil.which("grep")
         if not grep:
             raise ValueError("search_text requires ripgrep (rg) or grep")
-        output = []
+        output: list[str] = []
         size = 0
+        batch: list[str] = []
+
+        def flush(paths: list[str]) -> bool:
+            """Run one grep over a batch; return False once the output cap is reached."""
+            nonlocal size
+            if not paths:
+                return True
+            result = run_process(
+                [grep, "-nH", "-I", "-E", "-e", pattern, "--", *paths],
+                cwd=self.root, text=True, capture_output=True, timeout=GREP_BATCH_TIMEOUT,
+            )
+            if result.returncode not in (0, 1):
+                raise ValueError(result.stderr.strip() or "grep failed")
+            output.append(result.stdout)
+            size += len(result.stdout)
+            return size <= MAX_TOOL_OUTPUT
+
         # Explicit files avoid recursive grep following symlinks outside the root.
         for directory, dirs, files in os.walk(self.root, followlinks=False):
             dirs[:] = sorted(name for name in dirs if not name.startswith("."))
@@ -666,18 +724,18 @@ class RepositoryTools:
                     continue
                 if not (fnmatch.fnmatch(relative, glob) or fnmatch.fnmatch(name, glob)):
                     continue
-                path = self.safe_path(relative)
-                result = run_process(
-                    [grep, "-nH", "-I", "-E", "-e", pattern, "--", str(path)],
-                    cwd=self.root, text=True, capture_output=True, timeout=30,
-                )
-                if result.returncode not in (0, 1):
-                    raise ValueError(result.stderr.strip() or "grep failed")
-                output.append(result.stdout)
-                size += len(result.stdout)
-                if size > MAX_TOOL_OUTPUT:
-                    return truncate("".join(output))
-        return "".join(output)
+                # Validate, but hand grep the relative path: absolute paths would
+                # echo the user's home directory back to the provider, and ripgrep
+                # already reports relative.
+                self.safe_path(relative)
+                batch.append(os.path.join(".", relative))
+                if len(batch) >= GREP_BATCH_SIZE:
+                    if not flush(batch):
+                        return truncate("".join(output))
+                    batch = []
+        if not flush(batch):
+            return truncate("".join(output))
+        return truncate("".join(output))
 
     def tool_git_status(self) -> str:
         return self.fixed_command(["git", "status", "--short", "--branch"])
@@ -698,7 +756,7 @@ class RepositoryTools:
             raise ValueError("old_text must be non-empty")
         if type(expected_occurrences) is not int or not 1 <= expected_occurrences <= 100:
             raise ValueError("expected_occurrences must be between 1 and 100")
-        target = self.safe_path(path)
+        target = self.safe_write_path(path)
         if target.stat().st_size > MAX_FILE_BYTES:
             raise ValueError(f"file exceeds {MAX_FILE_BYTES} byte edit limit")
         original = target.read_text(encoding="utf-8")
@@ -718,7 +776,7 @@ class RepositoryTools:
             raise ValueError("write tools are disabled")
         if len(content.encode("utf-8")) > MAX_FILE_BYTES:
             raise ValueError(f"content exceeds {MAX_FILE_BYTES} byte write limit")
-        target = self.safe_path(path, allow_missing=True)
+        target = self.safe_write_path(path, allow_missing=True)
         target.parent.mkdir(parents=True, exist_ok=True)
         self.atomic_write(target, content)
         return f"wrote {len(content.encode('utf-8'))} bytes to {target.relative_to(self.root)}"
@@ -733,14 +791,24 @@ class RepositoryTools:
             raise ValueError(f"executable is not allow-listed: {argv[0]}")
         if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 900:
             raise ValueError("timeout_seconds must be an integer between 1 and 900")
+        forbidden = COMMAND_ARGUMENT_DENYLIST.get(Path(executable).name, ())
+        for argument in argv[1:]:
+            if argument in forbidden or any(
+                argument.startswith(f"{flag}=") for flag in forbidden if flag.startswith("--")
+            ):
+                raise ValueError(
+                    f"argument is not permitted for {argv[0]}: {argument}; it can execute "
+                    "an arbitrary command through configuration"
+                )
         command_cwd = self.safe_path(cwd)
         if not command_cwd.is_dir():
             raise ValueError(f"command cwd is not a directory: {cwd}")
         environment = {
             key: value
             for key, value in os.environ.items()
-            if not any(marker in key.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
+            if key in COMMAND_ENV_ALLOWLIST
         }
+        environment["PWD"] = str(command_cwd)
         result = run_process(
             [executable, *argv[1:]],
             cwd=command_cwd,
@@ -791,6 +859,13 @@ def function_tool(name: str, description: str, parameters: dict[str, Any]) -> di
     }
 
 
+def read_version() -> str:
+    try:
+        return (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unknown"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mission", type=Path)
@@ -816,6 +891,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", type=Path, help="Resume from an existing run directory")
     parser.add_argument("--models", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--version", action="version", version=f"corvee {read_version()}")
     return parser
 
 
@@ -848,14 +924,6 @@ def main() -> int:
             fail("model configuration 'model' must be a string or null")
         model_config_value = configured_model or ""
 
-    base_url = (
-        args.base_url
-        or os.environ.get("CORVEX_API_URL")
-        or env_file_values.get("CORVEX_API_URL")
-        or env_file_values.get("API_URL")
-        or config.get("base_url")
-        or DEFAULT_BASE_URL
-    )
     model = (
         args.model
         or model_config_value
@@ -866,14 +934,37 @@ def main() -> int:
         or ""
     )
     api_key_env = args.api_key_env or config.get("api_key_env") or DEFAULT_API_KEY_ENV
-    api_key = os.environ.get(api_key_env, "") or env_file_values.get(api_key_env, "")
+    api_key = os.environ.get(api_key_env, "")
+    key_from_env_file = False
     if not api_key:
-        api_key = env_file_values.get("CORVEX_API_KEY", "") or env_file_values.get("API_KEY", "")
+        api_key = (
+            env_file_values.get(api_key_env, "")
+            or env_file_values.get("CORVEX_API_KEY", "")
+            or env_file_values.get("API_KEY", "")
+        )
+        key_from_env_file = bool(api_key)
     if not api_key:
         try:
             api_key = resolve_api_key(config, config_path, env_file_values)
         except ConfigError as exc:
             fail(str(exc))
+
+    # An --env-file may redirect the endpoint only when it also supplies the
+    # credential. Otherwise a repo-local .env could aim the user's real key at
+    # an attacker's host, which exfiltrates it in the first Authorization header.
+    env_file_url = env_file_values.get("CORVEX_API_URL") or env_file_values.get("API_URL")
+    if env_file_url and not key_from_env_file:
+        fail(
+            "--env-file sets an API URL but not the API key; refusing to send an "
+            "externally configured credential to a file-supplied endpoint"
+        )
+    base_url = (
+        args.base_url
+        or os.environ.get("CORVEX_API_URL")
+        or (env_file_url if key_from_env_file else "")
+        or config.get("base_url")
+        or DEFAULT_BASE_URL
+    )
 
     if not api_key:
         fail(
@@ -1136,7 +1227,10 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
         if tool_calls:
             assistant_message["tool_calls"] = tool_calls
         messages.append(assistant_message)
-        checkpoint("response_received")
+        if not tool_calls:
+            # Tool steps checkpoint again as "tool_pending" before executing anything,
+            # so a snapshot here would rewrite the whole history for nothing.
+            checkpoint("response_received")
 
         if not tool_calls:
             content = message.get("content")
@@ -1145,7 +1239,8 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
             if journal:
                 protected_write(journal.directory / "report.md", journal.redact(
                     (f"# Incomplete: {stop_reason}\n\n" if stop_reason else "") + content))
-            print((f"Incomplete ({stop_reason}):\n" if stop_reason else "") + content)
+            printable = (f"Incomplete ({stop_reason}):\n" if stop_reason else "") + content
+            print(journal.redact(printable) if journal else printable)
             return 3 if stop_reason else 0
 
         if stop_reason:

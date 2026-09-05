@@ -7,7 +7,7 @@ import tarfile
 
 
 PACKAGE_FILES = (
-    "SKILL.md", "README.md", "LICENSE", "VERSION", "agents/openai.yaml",
+    "SKILL.md", "README.md", "CHANGELOG.md", "LICENSE", "VERSION", "agents/openai.yaml",
     "references/control-protocol.md", "references/mission-format.md",
     "references/provider-setup.md", "references/native-compatibility.md",
     "scripts/corvee", "scripts/corvee.py",
@@ -16,6 +16,13 @@ PACKAGE_FILES = (
     "scripts/credential_helper.py",
 )
 TEST_FILES = ("tests/test_corvee.py", "tests/fixtures/live_readonly_mission.md")
+# Development-only resources, listed explicitly so a drift check can tell a
+# deliberate exclusion from a newly added file someone forgot to package.
+EXCLUDED_FILES = (
+    "pyproject.toml",
+    ".gitignore",
+    ".github/workflows/ci.yml",
+)
 
 
 def checked_files(root: Path, include_tests: bool = False):

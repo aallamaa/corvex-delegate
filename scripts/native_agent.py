@@ -85,6 +85,8 @@ def install_native_agent(
     end_count = existing.count(PROVIDER_END)
     if begin_count != end_count or begin_count > 1:
         raise ConfigError("Codex config has malformed corvee provider markers")
+    if begin_count == 1 and existing.index(PROVIDER_END) < existing.index(PROVIDER_BEGIN):
+        raise ConfigError("Codex config has corvee provider markers in the wrong order")
     block = _provider_block(base_url, credential_helper, delegate_config)
     if begin_count == 1:
         start = existing.index(PROVIDER_BEGIN)

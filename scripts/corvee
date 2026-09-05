@@ -33,6 +33,7 @@ def main() -> int:
     commands = {"configure", "models", "select", "show", "check"}
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print("Usage: corvee COMMAND [OPTIONS]")
+        print("Durations accept seconds or a 30s/30m/2h suffix.")
         print("Commands: configure, models [PATTERN], select MODEL, show, check, cleanup, run")
         print("For command help: corvee COMMAND --help")
         print("target, analyze, refine, loop, audit and status are Codex skill instructions;")
@@ -98,8 +99,8 @@ def main() -> int:
 
         try:
             translated_prefix_and_args = _normalize_timeout_aliases([*shared_prefix, *arguments])
-        except Exception:
-            print(f"invalid --timeout value", file=sys.stderr)
+        except (ValueError, argparse.ArgumentTypeError) as exc:
+            print(f"invalid --timeout value: {exc}", file=sys.stderr)
             return 2
         sys.argv = [sys.argv[0], *translated_prefix_and_args]
         return run()

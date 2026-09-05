@@ -50,6 +50,8 @@ python3 <skill-dir>/scripts/corvee run \
 
 Omit `--write` for analysis and review. Enable it only for authorized edits, and pass `--allow-command NAME` only for needed executables. Command execution is not a security sandbox; interpreters, compilers, and repository scripts can execute arbitrary code. File tools confine paths to the repository but do not guarantee that repository contents are secret-free. Use a sanitized checkout when needed.
 
+Write tools additionally refuse `.git/` and `.codex/corvee/reports/` after symlink resolution: the first would grant execution through hooks or `core.sshCommand` on your next git operation, the second holds the evidence you audit. Both stay readable. Allow-listed commands receive only a fixed environment allow-list (`PATH`, `HOME`, locale, and similar), so agent sockets and provider variables are not inherited.
+
 Allowed executables are resolved at startup; delegate commands must use the exact authorized name or path. Search prefers `rg` and falls back to `grep` with extended regular expressions. The fallback skips hidden entries and symlinks but does not honor `.gitignore`, so ignored private files must be removed from shared checkouts. Linux/macOS wall-clock deadlines interrupt blocked requests and terminate active command process groups; deliberately detached processes are not sandboxed.
 
 After each run, capture the report and exit status, inspect changes, independently rerun decisive checks, and update the ledger with evidence. Exit zero means a report was returned, not that the target passed. Timeouts and missing reports are incomplete work. Never weaken acceptance gates to obtain success.

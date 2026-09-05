@@ -18,6 +18,7 @@ from corvee_config import (
     get_codex_home,
     load_config,
     load_env_file,
+    parse_duration,
     probe_responses_api,
     resolve_api_key,
     update_selected_model,
@@ -41,8 +42,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--agent-file", type=Path, default=codex_home / "agents" / "corvee.toml"
     )
-    result.add_argument("--timeout", type=int, default=600,
-                        help="Request timeout in seconds (default: 600)")
+    result.add_argument("--timeout", type=parse_duration, default=600,
+                        help="Request timeout; seconds or a 30s/30m/2h suffix (default: 600)")
     commands = result.add_subparsers(dest="command", required=True)
 
     configure = commands.add_parser("configure", help="validate and save provider settings")
@@ -76,10 +77,16 @@ def parser() -> argparse.ArgumentParser:
 def configure(args: argparse.Namespace) -> int:
     env_values = load_env_file(args.from_env_file.resolve(strict=True)) if args.from_env_file else {}
     current = load_config(args.config)
+    env_file_url = env_values.get("CORVEX_API_URL") or env_values.get("API_URL")
+    env_file_key = env_values.get("CORVEX_API_KEY", "") or env_values.get("API_KEY", "")
+    if env_file_url and not env_file_key and not args.url:
+        raise ConfigError(
+            "--from-env-file sets an API URL but not the API key; supply --url explicitly "
+            "rather than pointing an externally configured credential at a file-supplied endpoint"
+        )
     default_url = (
         args.url
-        or env_values.get("CORVEX_API_URL")
-        or env_values.get("API_URL")
+        or env_file_url
         or current.get("base_url")
         or DEFAULT_BASE_URL
     )

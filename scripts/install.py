@@ -81,7 +81,8 @@ def main() -> int:
 
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".corvee-stage-", dir=target.parent))
-    backup = target.parent / f".corvee-backup-{os.getpid()}"
+    backup_holder = Path(tempfile.mkdtemp(prefix=".corvee-backup-", dir=target.parent))
+    backup = backup_holder / "previous"
     try:
         for name, path in resources:
             destination = stage / name
@@ -94,11 +95,12 @@ def main() -> int:
         if not (target.exists() or target.is_symlink()) and (backup.exists() or backup.is_symlink()):
             os.replace(backup, target)
         remove_backup(stage)
+        remove_backup(backup_holder)
         print(f"skill installation failed after configuration: {exc}", file=sys.stderr)
         return 1
 
     try:
-        remove_backup(backup)
+        remove_backup(backup_holder)
     except OSError as exc:
         print(f"Installed successfully, but backup cleanup failed: {backup}: {exc}", file=sys.stderr)
 

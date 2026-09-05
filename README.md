@@ -75,7 +75,7 @@ Use `COMMAND --help` for options. `--config PATH` selects another settings file.
 
 ### Long requests and recovery
 
-Inference requests default to a **600-second** socket timeout (`run --http-timeout`, or `--timeout` for configuration commands). The runner's total `--max-time` remains a hard wall-clock boundary. Between requests it reserves up to 20% of the run budget for reporting, so a shorter run may cap an individual request below 600 seconds.
+Inference requests default to a **600-second** socket timeout (`run --http-timeout`, or `--timeout` for configuration commands). Every duration option accepts plain seconds or a `30s`/`30m`/`2h` suffix. The runner's total `--max-time` remains a hard wall-clock boundary. Between requests it reserves up to 20% of the run budget for reporting, so a shorter run may cap an individual request below 600 seconds.
 
 Each non-dry run creates a new private directory under `.codex/corvee/reports/`, or at `--run-dir PATH` (which must not already exist). It contains metadata-only `events.jsonl`, `status.json`, `report.md`, and an atomic `checkpoint.json` with conversation and tool results. Directories are mode 0700 and files mode 0600. Checkpoints contain repository content: do not publish them or treat key redaction as a comprehensive secret scanner.
 
@@ -93,6 +93,12 @@ Settings live in `${CODEX_HOME:-~/.codex}/corvee/config.toml`; the key lives bes
 
 Mission text and tool results are sent to the configured provider. File tools operate inside the selected repository; read-only mode omits editing tools. Commands are disabled unless enabled with `--allow-command`. This is not an OS sandbox or a comprehensive secret scanner: delegate only content you may share and use a sanitized checkout where appropriate. Codex independently verifies returned work.
 
+Even in `--write` mode, `write_file` and `replace_text` refuse `.git/` and `.codex/corvee/reports/` after resolving symlinks. Writing `.git/hooks/*` or `core.sshCommand` would otherwise execute on your next git operation regardless of `--allow-command`, and the report tree is the evidence trail. Both remain readable. A `.git` component anywhere in the path is refused, case-insensitively, so vendored checkouts and submodules are covered as well as the root repository.
+
+Allow-listed commands run with a fixed environment allow-list (`PATH`, `HOME`, `TMPDIR`, locale, terminal); everything else, including `SSH_AUTH_SOCK`, `PYTHONPATH`, and `CORVEX_API_URL`, is stripped. Configuration flags that make an allow-listed binary run something else (`git -c`, `--config-env`, `--exec-path`, `ssh -o`, `rsync -e`) are refused. This narrows the blast radius but does not change the rule that allow-listing an interpreter, compiler, or build tool grants arbitrary code execution.
+
+An `--env-file` may override the API URL only when it also supplies the API key, so a repository-local `.env` cannot redirect an externally configured credential to another host.
+
 ## Native agents
 
 The supported workflow uses the direct runner. Cross-provider native delegation failed in Codex CLI 0.153.2: an OpenAI parent spawned the custom role but the child retained OpenAI's provider. A separate Codex process configured for Corvex worked. Experimental helpers remain for investigation; normal installation does not install a native agent or modify the primary Codex provider. See [compatibility evidence](references/native-compatibility.md).
@@ -101,11 +107,13 @@ The supported workflow uses the direct runner. Cross-provider native delegation 
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py' -v
+ruff check scripts tests
 python3 scripts/corvee --help
+python3 scripts/corvee.py --version
 python3 scripts/package.py
 ```
 
-Tests use a mock provider and no real key. Live checks are opt-in. Packaging creates a filtered archive and SHA-256 checksum in `dist/`.
+CI runs the same checks on Linux and macOS across Python 3.11-3.13. Tests use a mock provider and no real key. Live checks are opt-in. Packaging creates a filtered archive and SHA-256 checksum in `dist/`.
 
 This is an independent community skill, not an official OpenAI or Corvex product.
 

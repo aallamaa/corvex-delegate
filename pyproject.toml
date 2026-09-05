@@ -1,0 +1,23 @@
+# Development tooling only. Corvée ships as a Codex skill directory, not a
+# distributable package; the runtime depends on the standard library alone.
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["dist", ".codex"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "RUF"]
+ignore = [
+    "E501",  # long lines are bounded by line-length, not flagged a second time
+]
+# SIM is deliberately excluded: its suggestions (ternaries, merged `with`
+# blocks, `any()` over explicit loops) are taste, and several of the flagged
+# sites are explicit NamedTemporaryFile atomic-write patterns that must not
+# become context managers.
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "RUF012"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

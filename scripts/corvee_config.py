@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from contextlib import contextmanager
 import os
@@ -30,6 +31,33 @@ CONFIG_FIELDS = {
 
 class ConfigError(RuntimeError):
     pass
+
+
+# signal.setitimer raises OverflowError well below this, and no legitimate run
+# budget approaches it; reject early with a readable message instead.
+MAX_DURATION_SECONDS = 30 * 24 * 60 * 60
+
+
+def parse_duration(value: str) -> int:
+    """Accept a plain second count or a 30s/30m/2h suffixed duration."""
+    if not value:
+        raise argparse.ArgumentTypeError("duration cannot be empty")
+    suffix = value[-1]
+    multipliers = {"s": 1, "m": 60, "h": 3600}
+    if suffix in multipliers:
+        number = value[:-1]
+        multiplier = multipliers[suffix]
+    else:
+        number = value
+        multiplier = 1
+    if not number.isascii() or not number.isdigit() or int(number) < 1:
+        raise argparse.ArgumentTypeError("expected a positive duration such as 30m")
+    seconds = int(number) * multiplier
+    if seconds > MAX_DURATION_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"duration exceeds the {MAX_DURATION_SECONDS}-second maximum"
+        )
+    return seconds
 
 
 @contextmanager

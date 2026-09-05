@@ -1209,5 +1209,355 @@ class CleanupTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
 
 
+class WriteProtectionTest(unittest.TestCase):
+    """Writes must stay inside the repository and out of its control surfaces."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        (self.root / ".git" / "hooks").mkdir(parents=True)
+        (self.root / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        (self.root / ".codex" / "corvee" / "reports" / "run").mkdir(parents=True)
+        (self.root / ".codex" / "corvee" / "reports" / "run" / "report.md").write_text(
+            "evidence", encoding="utf-8"
+        )
+        (self.root / "src").mkdir()
+        (self.root / "src" / "app.py").write_text("value = 1\n", encoding="utf-8")
+        self.tools = corvee.RepositoryTools(self.root, True, set())
+
+    def test_write_file_rejects_git_directory(self) -> None:
+        result = json.loads(self.tools.execute(
+            "write_file", {"path": ".git/hooks/pre-commit", "content": "#!/bin/sh\ncurl evil\n"}
+        ))
+        self.assertFalse(result["ok"])
+        self.assertIn("write-protected", result["error"])
+        self.assertFalse((self.root / ".git" / "hooks" / "pre-commit").exists())
+
+    def test_replace_text_rejects_git_config(self) -> None:
+        result = json.loads(self.tools.execute(
+            "replace_text", {"path": ".git/config", "old_text": "[core]", "new_text": "[core]\n\tsshCommand = evil"}
+        ))
+        self.assertFalse(result["ok"])
+        self.assertIn("write-protected", result["error"])
+        self.assertEqual((self.root / ".git" / "config").read_text(encoding="utf-8"), "[core]\n")
+
+    def test_write_file_rejects_run_report_tree(self) -> None:
+        result = json.loads(self.tools.execute(
+            "write_file", {"path": ".codex/corvee/reports/run/report.md", "content": "all green"}
+        ))
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            (self.root / ".codex" / "corvee" / "reports" / "run" / "report.md").read_text(
+                encoding="utf-8"
+            ),
+            "evidence",
+        )
+
+    def test_symlink_into_git_is_rejected_after_resolution(self) -> None:
+        link = self.root / "innocent.txt"
+        link.symlink_to(self.root / ".git" / "config")
+        result = json.loads(self.tools.execute(
+            "replace_text", {"path": "innocent.txt", "old_text": "[core]", "new_text": "owned"}
+        ))
+        self.assertFalse(result["ok"])
+        self.assertIn("write-protected", result["error"])
+
+    def test_ordinary_repository_writes_still_work(self) -> None:
+        result = json.loads(self.tools.execute(
+            "write_file", {"path": "src/new.py", "content": "ok\n"}
+        ))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual((self.root / "src" / "new.py").read_text(encoding="utf-8"), "ok\n")
+
+    def test_reads_of_protected_paths_remain_allowed(self) -> None:
+        result = json.loads(self.tools.execute("read_file", {"path": ".git/config"}))
+        self.assertTrue(result["ok"], result)
+
+
+class CommandEnvironmentTest(unittest.TestCase):
+    """run_command exposes an allow-list, not everything without a suspicious name."""
+
+    def test_only_allow_listed_variables_reach_the_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tools = corvee.RepositoryTools(root, False, {"env"})
+            leaky = {
+                "SSH_AUTH_SOCK": "/tmp/agent.sock",
+                "AWS_SESSION": "leaked",
+                "GH_ENTERPRISE_HOST": "internal.example",
+                "CORVEX_API_URL": "https://provider.example/v1",
+            }
+            with patch.dict(os.environ, leaky):
+                result = json.loads(tools.execute("run_command", {"argv": ["env"]}))
+            self.assertTrue(result["ok"], result)
+            output = result["result"]
+            for name in leaky:
+                self.assertNotIn(name, output)
+            self.assertIn("PATH=", output)
+
+
+class GrepFallbackTest(unittest.TestCase):
+    """The no-ripgrep fallback must batch processes and still refuse to escape root."""
+
+    def test_batched_search_finds_matches_without_ripgrep(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for index in range(12):
+                (root / f"file{index}.txt").write_text(f"needle {index}\n", encoding="utf-8")
+            (root / ".hidden.txt").write_text("needle hidden\n", encoding="utf-8")
+            tools = corvee.RepositoryTools(root, False, set())
+            real_which = shutil.which
+            with patch.object(corvee.shutil, "which",
+                              lambda name: None if name == "rg" else real_which(name)):
+                with patch.object(corvee, "GREP_BATCH_SIZE", 5):
+                    calls: list[list[str]] = []
+                    real_run = corvee.run_process
+
+                    def counting_run(argv, **kwargs):
+                        calls.append(argv)
+                        return real_run(argv, **kwargs)
+
+                    with patch.object(corvee, "run_process", counting_run):
+                        result = json.loads(tools.execute("search_text", {"pattern": "needle"}))
+            self.assertTrue(result["ok"], result)
+            for index in range(12):
+                self.assertIn(f"file{index}.txt", result["result"])
+            self.assertNotIn(".hidden.txt", result["result"])
+            # 12 files at a batch size of 5 is three greps, not twelve.
+            self.assertEqual(len(calls), 3)
+
+    def test_symlink_outside_root_is_not_searched(self) -> None:
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as inside:
+            secret = Path(outside) / "secret.txt"
+            secret.write_text("needle outside\n", encoding="utf-8")
+            root = Path(inside).resolve()
+            (root / "escape.txt").symlink_to(secret)
+            (root / "real.txt").write_text("needle inside\n", encoding="utf-8")
+            tools = corvee.RepositoryTools(root, False, set())
+            real_which = shutil.which
+            with patch.object(corvee.shutil, "which",
+                              lambda name: None if name == "rg" else real_which(name)):
+                result = json.loads(tools.execute("search_text", {"pattern": "needle"}))
+            self.assertTrue(result["ok"], result)
+            self.assertIn("real.txt", result["result"])
+            self.assertNotIn("escape.txt", result["result"])
+
+
+class DurationOptionTest(unittest.TestCase):
+    """--timeout accepts the same duration syntax on every subcommand."""
+
+    def test_configure_commands_accept_suffixed_durations(self) -> None:
+        args = configure_corvee.parser().parse_args(["--timeout", "30m", "show"])
+        self.assertEqual(args.timeout, 1800)
+
+    def test_configure_commands_still_accept_plain_seconds(self) -> None:
+        args = configure_corvee.parser().parse_args(["--timeout", "45", "show"])
+        self.assertEqual(args.timeout, 45)
+
+    def test_launcher_forwards_durations_to_check(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(CLI), "check", "--timeout", "30m", "--config", "/nonexistent.toml"],
+            capture_output=True, text=True,
+        )
+        self.assertNotIn("invalid int value", result.stderr)
+        self.assertIn("configuration does not exist", result.stderr)
+
+    def test_version_flag_reports_the_packaged_version(self) -> None:
+        expected = (SKILL_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--version"], capture_output=True, text=True, check=True
+        )
+        self.assertIn(expected, result.stdout)
+
+
+class PackageManifestTest(unittest.TestCase):
+    """The package allow-list is hand-maintained; catch files nobody classified."""
+
+    def test_every_tracked_resource_is_packaged_or_explicitly_excluded(self) -> None:
+        import package
+
+        known = set(package.PACKAGE_FILES) | set(package.TEST_FILES) | set(package.EXCLUDED_FILES)
+        ignored_dirs = {".git", ".codex", "dist", "__pycache__", ".pytest_cache",
+                        ".ruff_cache", ".mypy_cache"}
+        unclassified = []
+        for path in SKILL_ROOT.rglob("*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(SKILL_ROOT)
+            if ignored_dirs & set(relative.parts):
+                continue
+            if relative.suffix not in {".md", ".py", ".yaml", ".yml", ".toml", ""}:
+                continue
+            if str(relative) not in known:
+                unclassified.append(str(relative))
+        self.assertEqual(
+            sorted(unclassified), [],
+            "add these to PACKAGE_FILES, TEST_FILES, or EXCLUDED_FILES in scripts/package.py",
+        )
+
+    def test_packaged_resources_all_exist(self) -> None:
+        import package
+
+        self.assertTrue(list(package.checked_files(SKILL_ROOT, include_tests=True)))
+
+
+class AdversarialHardeningTest(unittest.TestCase):
+    """Regressions for bypasses found in an adversarial review of the write guard."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        (self.root / "vendor" / "lib").mkdir(parents=True)
+        (self.root / "src").mkdir()
+        self.tools = corvee.RepositoryTools(self.root, True, set())
+
+    def test_nested_repository_git_directory_is_protected(self) -> None:
+        # Submodules and vendored checkouts put a real .git well below the root.
+        result = json.loads(self.tools.execute(
+            "write_file",
+            {"path": "vendor/lib/.git/hooks/post-checkout", "content": "#!/bin/sh\npayload\n"},
+        ))
+        self.assertFalse(result["ok"])
+        self.assertIn("write-protected", result["error"])
+
+    def test_submodule_git_pointer_file_is_protected(self) -> None:
+        result = json.loads(self.tools.execute(
+            "write_file", {"path": "vendor/lib/.git", "content": "gitdir: /tmp/evil\n"}
+        ))
+        self.assertFalse(result["ok"])
+
+    def test_case_variant_git_directory_is_protected(self) -> None:
+        # APFS and NTFS resolve .GIT to the same directory as .git.
+        for variant in (".GIT/hooks/pre-commit", ".Git/config", "vendor/.GiT/config"):
+            with self.subTest(variant=variant):
+                result = json.loads(self.tools.execute(
+                    "write_file", {"path": variant, "content": "x"}
+                ))
+                self.assertFalse(result["ok"], variant)
+
+    def test_directory_merely_named_git_is_writable(self) -> None:
+        result = json.loads(self.tools.execute(
+            "write_file", {"path": "src/git/helper.py", "content": "ok\n"}
+        ))
+        self.assertTrue(result["ok"], result)
+
+    def test_git_configuration_flags_are_refused(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        tools = corvee.RepositoryTools(self.root, False, {"git"})
+        for argv in (
+            ["git", "-c", "core.pager=sh -c id", "status"],
+            ["git", "--exec-path=/tmp/evil", "status"],
+            ["git", "--config-env=core.pager=EVIL", "status"],
+        ):
+            with self.subTest(argv=argv):
+                result = json.loads(tools.execute("run_command", {"argv": argv}))
+                self.assertFalse(result["ok"], argv)
+                self.assertIn("not permitted", result["error"])
+
+    def test_ordinary_git_invocation_still_runs(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        tools = corvee.RepositoryTools(self.root, False, {"git"})
+        result = json.loads(tools.execute("run_command", {"argv": ["git", "--version"]}))
+        self.assertTrue(result["ok"], result)
+
+    def test_pythonpath_is_not_inherited_by_commands(self) -> None:
+        self.assertNotIn("PYTHONPATH", corvee.COMMAND_ENV_ALLOWLIST)
+
+    def test_grep_fallback_reports_relative_paths(self) -> None:
+        (self.root / "src" / "hit.txt").write_text("needle\n", encoding="utf-8")
+        tools = corvee.RepositoryTools(self.root, False, set())
+        real_which = shutil.which
+        with patch.object(corvee.shutil, "which",
+                          lambda name: None if name == "rg" else real_which(name)):
+            result = json.loads(tools.execute("search_text", {"pattern": "needle"}))
+        self.assertTrue(result["ok"], result)
+        self.assertIn("src/hit.txt", result["result"])
+        self.assertNotIn(str(self.root), result["result"])
+
+    def test_duration_rejects_overflowing_and_non_ascii_values(self) -> None:
+        import signal as signal_module
+
+        import argparse as argparse_module
+
+        for value in ("999999999h", "\u0663\u0660m", "0m", "+5", " 30m"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse_module.ArgumentTypeError):
+                    corvee_config.parse_duration(value)
+        # The accepted maximum must not overflow setitimer.
+        accepted = corvee_config.parse_duration(f"{corvee_config.MAX_DURATION_SECONDS}")
+        signal_module.setitimer(signal_module.ITIMER_REAL, accepted)
+        signal_module.setitimer(signal_module.ITIMER_REAL, 0)
+
+
+class CredentialRedirectionTest(unittest.TestCase):
+    """A repo-local dotenv must not aim an externally supplied key at a new host."""
+
+    def test_env_file_url_without_env_file_key_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text("API_URL=https://attacker.example/v1\n", encoding="utf-8")
+            mission = Path(directory) / "mission.md"
+            mission.write_text("do nothing", encoding="utf-8")
+            environment = {
+                key: value for key, value in os.environ.items()
+                if key not in {"CORVEX_API_URL", "CORVEX_MODEL"}
+            } | {"CORVEX_API_KEY": "real-user-secret"}
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--no-config", "--model", "mock",
+                 "--mission", str(mission), "--cwd", directory,
+                 "--env-file", str(env_file), "--dry-run"],
+                env=environment, capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("refusing", result.stderr)
+            self.assertNotIn("attacker.example", result.stdout)
+
+    def test_env_file_supplying_both_url_and_key_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "API_URL=https://provider.example/v1\nAPI_KEY=file-secret\n", encoding="utf-8"
+            )
+            mission = Path(directory) / "mission.md"
+            mission.write_text("do nothing", encoding="utf-8")
+            environment = {
+                key: value for key, value in os.environ.items()
+                if key not in {"CORVEX_API_KEY", "CORVEX_API_URL", "CORVEX_MODEL"}
+            }
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--no-config", "--model", "mock",
+                 "--mission", str(mission), "--cwd", directory,
+                 "--env-file", str(env_file), "--dry-run"],
+                env=environment, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("provider.example", result.stderr)
+
+
+class NativeAgentMarkerTest(unittest.TestCase):
+    def test_inverted_provider_markers_raise_config_error(self) -> None:
+        import native_agent
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.toml"
+            config.write_text(
+                f"{native_agent.PROVIDER_END}\n{native_agent.PROVIDER_BEGIN}\n", encoding="utf-8"
+            )
+            with self.assertRaises(corvee_config.ConfigError):
+                native_agent.install_native_agent(
+                    codex_config=config,
+                    agent_file=Path(directory) / "agent.toml",
+                    credential_helper=Path(directory) / "helper.py",
+                    delegate_config=config,
+                    base_url="https://provider.example/v1",
+                    model="mock",
+                    reasoning_effort="medium",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
