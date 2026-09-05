@@ -7,6 +7,14 @@ All notable changes to this skill are recorded here. This project follows
 
 ### Fixed
 
+- A provider response whose body died mid-read raised
+  `http.client.IncompleteRead`, which descends from `Exception`, not `OSError`,
+  and so slipped past every clause in `request_json`. It reached `main()` as an
+  unhandled internal error and exited 1 instead of being classified as a
+  retryable transport failure, so the retry path never engaged for the one
+  failure it most obviously covers. `http.client.HTTPException` is now caught
+  and classified `connection_error`.
+
 - `RunJournal.summarize` matched event names the runner never emits (`error`,
   `tools_disabled`, `budget_warning`, `tool_error`) and misspelled `wrap_up` as
   `wrapup`. Every outcome-changing event -- wrap-up, wrap-up rejection, stalls,
@@ -50,6 +58,16 @@ All notable changes to this skill are recorded here. This project follows
   list from the checkpoint instead of failing and making the user reconstruct
   them. A flag that conflicts with the checkpoint is still refused, so a resume
   cannot silently widen or narrow a delegate's authority.
+
+### Removed
+
+- `tests/fixtures/live_readonly_mission.md`: nothing has read it since the live
+  integration tests were dropped, and it survived only as an entry in the
+  package manifest that kept the manifest test quiet. Its text still described
+  the skill in terms of an OMP dependency that no longer appears anywhere.
+- The `--http-timeout` and `--timeout` positivity checks. `parse_duration` is
+  the only producer of both values and already refuses anything below one
+  second, with a test covering it; the downstream guards could not fire.
 
 ### Changed
 

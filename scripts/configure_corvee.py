@@ -134,8 +134,6 @@ def main() -> int:
     args = parser().parse_args()
     try:
         args.config = args.config.expanduser().resolve()
-        if args.timeout < 1:
-            raise ConfigError("timeout must be positive")
         if args.command == "configure":
             return configure(args)
         if args.command == "select" and args.model is None:

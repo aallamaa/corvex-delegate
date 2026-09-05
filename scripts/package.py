@@ -14,7 +14,7 @@ PACKAGE_FILES = (
     "scripts/corvee_config.py", "scripts/configure_corvee.py",
     "scripts/install.py", "scripts/package.py",
 )
-TEST_FILES = ("tests/test_corvee.py", "tests/fixtures/live_readonly_mission.md")
+TEST_FILES = ("tests/test_corvee.py",)
 # Development-only resources, listed explicitly so a drift check can tell a
 # deliberate exclusion from a newly added file someone forgot to package.
 EXCLUDED_FILES = (

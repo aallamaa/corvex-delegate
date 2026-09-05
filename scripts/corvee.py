@@ -1109,8 +1109,6 @@ def main() -> int:
         fail("--mission is required unless --resume is used")
     if args.max_steps is not None and args.max_steps < 1:
         fail("--max-steps must be positive")
-    if args.http_timeout < 1:
-        fail("--http-timeout must be positive")
     if not 0 <= args.request_retries <= 2:
         fail("--request-retries must be between 0 and 2")
 

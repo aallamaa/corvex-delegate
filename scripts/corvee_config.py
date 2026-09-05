@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from http import client
 import json
 from contextlib import contextmanager
 import os
@@ -161,6 +162,12 @@ def request_json(req: request.Request, *, timeout: int, deadline: bool = True) -
         raise TransportError(retryable_category, True) from None
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise TransportError("invalid_json") from None
+    except client.HTTPException:
+        # A body that dies mid-read (IncompleteRead, BadStatusLine) is a
+        # transport failure, but http.client.HTTPException descends from
+        # Exception, not OSError, so it slips past the clause below and would
+        # otherwise crash the run instead of being retried.
+        raise TransportError("connection_error", True) from None
     except (ConnectionError, OSError):
         raise TransportError("connection_error", True) from None
 

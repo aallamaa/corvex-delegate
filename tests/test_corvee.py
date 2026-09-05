@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from http import client as http_client
 from pathlib import Path
 import subprocess
 import tempfile
@@ -1467,11 +1468,16 @@ class HttpTimeoutDurationTest(unittest.TestCase):
         args = corvee.build_parser().parse_args(["--http-timeout", "30m"])
         self.assertEqual(args.http_timeout, 1800)
 
-    def test_plain_seconds_still_work_and_default_is_600(self) -> None:
-        self.assertEqual(corvee.build_parser().parse_args([]).http_timeout, 600)
+    def test_plain_seconds_are_still_accepted(self) -> None:
+        # The 600-second default is asserted by RunnerRecoveryTest.
         self.assertEqual(
             corvee.build_parser().parse_args(["--http-timeout", "45"]).http_timeout, 45
         )
+
+    def test_a_non_positive_duration_is_refused_at_the_parser(self) -> None:
+        # main() no longer re-checks this; parse_duration is the only guard.
+        with self.assertRaises(SystemExit):
+            corvee.build_parser().parse_args(["--http-timeout", "0"])
 
 
 class DurationOptionTest(unittest.TestCase):
@@ -1800,6 +1806,29 @@ class SharedTransportTest(unittest.TestCase):
                 corvee_config.verify_credential("https://provider.example/v1", "k", "m", 5)
         for surfaced in (runner_error, config_error, verify_error):
             self.assertNotIn("sk-live-REALKEY", str(surfaced.exception))
+
+    def test_a_body_that_dies_mid_read_is_a_retryable_transport_error(self) -> None:
+        # http.client.HTTPException descends from Exception, not OSError, so a
+        # truncated body slipped past every clause and crashed the run instead
+        # of being retried.
+        class Truncated:
+            headers = None
+
+            def read(self):
+                raise http_client.IncompleteRead(b"partial", 4096)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        client = corvee.ApiClient("https://example.com", "fake")
+        with patch.object(corvee_config, "open_request", return_value=Truncated()):
+            with self.assertRaises(corvee_config.TransportError) as surfaced:
+                client.call("POST", "/chat/completions", {})
+        self.assertEqual(surfaced.exception.category, "connection_error")
+        self.assertTrue(surfaced.exception.retryable)
 
     def test_invalid_json_is_not_retryable(self) -> None:
         with patch.object(corvee_config, "open_request",
