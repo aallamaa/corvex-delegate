@@ -118,7 +118,9 @@ Repeat `run` until the explicit condition is independently verified. A budget wr
 
 Defaults are six iterations and 120 minutes for the current invocation unless `TARGET.md` specifies a lower budget. A user-supplied lower boundary wins. Never silently exceed an iteration, time, or stated cost budget.
 
-Record the start time and completed iterations. Pass at most the remaining time to each runner through `--max-time` and stop launching work when it is exhausted. No token-price estimator is bundled: if the user supplies a monetary cap, establish a measurable usage limit before launching billable work.
+Record the start time and completed iterations. Pass at most the remaining time to each runner through `--max-time` and stop launching work when it is exhausted.
+
+The runner records what the provider reports: `status.json` carries a `usage` object with `requests`, `prompt_tokens`, `completion_tokens`, `total_tokens`, and `reported_by_provider`. Per-request counts appear on `request_end` in `events.jsonl`. No prices are bundled, so tokens do not convert to money here. If the user sets a monetary cap, translate it into iteration, step and time budgets before launching billable work, and report token totals from `status.json` rather than estimating them. When `reported_by_provider` is false the provider returned no counts: say usage is unmeasured, never that it was zero.
 
 After each iteration, reconsider the next unit from current evidence. Do not replay an identical failed mission. Stop and report clearly when any of these occurs:
 
@@ -136,7 +138,7 @@ Try to falsify the current completion claim. Prefer a fresh read-only delegate m
 
 ### `status`
 
-Report the outcome, gate checklist, latest verified evidence, current blocker, budget consumed, and next recommended action. Do not invoke a delegate unless fresh evidence is required and the user also requested progress.
+Report the outcome, gate checklist, latest verified evidence, current blocker, budget consumed, and next recommended action. Budget consumed means iterations and wall-clock time, plus the token totals in `status.json` when the provider reported them. Do not estimate token counts or costs that were not measured. Do not invoke a delegate unless fresh evidence is required and the user also requested progress.
 
 ### `models [PATTERN]`
 

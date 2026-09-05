@@ -37,14 +37,24 @@ from corvee_config import (
 )
 
 
-MAX_FILE_BYTES = 200_000
+# Every tool result is truncated to this before it reaches the model, so it is
+# also the ceiling on how much of a file one read can usefully return.
 MAX_TOOL_OUTPUT = 30_000
+# Editing is whole-file, so both the file and its replacement must fit in memory.
+MAX_EDIT_BYTES = 200_000
+# A mission is a prompt, not a payload.
+MAX_MISSION_BYTES = 200_000
+# Directory listings are capped identically whether or not ripgrep is present.
+MAX_LIST_ENTRIES = 1_000
 
 # A deny-list cannot keep pace with credential-bearing variable names, and it
 # leaks channels such as SSH_AUTH_SOCK that carry no secret in the name itself.
 # grep fallback batching: one process per chunk of files, not per file.
 GREP_BATCH_SIZE = 256
 GREP_BATCH_TIMEOUT = 60
+# A per-batch timeout alone bounds nothing: a large tree is many batches, and
+# one search could otherwise consume an entire run budget.
+GREP_TOTAL_TIMEOUT = 120
 
 COMMAND_ENV_ALLOWLIST = frozenset({
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR",
@@ -122,6 +132,30 @@ class RunJournal:
         self.messages = []
         self.phase = "starting"
         self.run_context: dict[str, Any] | None = None
+        # Provider-reported token counts. The protocol asks the planner to
+        # report budget consumed, so the runner has to actually measure it.
+        self.usage = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                      "total_tokens": 0, "reported_by_provider": False}
+    def record_usage(self, usage: Any) -> dict[str, int]:
+        """Accumulate one response's token counts, ignoring absent or odd values.
+
+        Not every OpenAI-compatible server returns usage, so the totals carry a
+        flag saying whether any of them did. Reporting zero as though it were
+        measured would be worse than saying nothing.
+        """
+        self.usage["requests"] += 1
+        step_usage: dict[str, int] = {}
+        if not isinstance(usage, dict):
+            return step_usage
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                self.usage[field] += value
+                step_usage[field] = value
+        if step_usage:
+            self.usage["reported_by_provider"] = True
+        return step_usage
+
     def redact(self, text: str) -> str:
         return text.replace(self.api_key, "[REDACTED]") if self.api_key else text
 
@@ -154,6 +188,7 @@ class RunJournal:
         self.checkpoint(self.messages, self.phase)
         protected_write(self.directory / "status.json", json.dumps({
             "status": status, "exit_code": code, "step": self.step, "phase": self.phase,
+            "usage": self.usage,
         }))
         self.event("run_end", status=status, exit_code=code)
         report = self.directory / "report.md"
@@ -637,11 +672,28 @@ class RepositoryTools:
         if type(start_line) is not int or start_line < 1 or type(line_count) is not int or not 1 <= line_count <= 1000:
             raise ValueError("start_line must be positive and line_count must be between 1 and 1000")
         target = self.safe_path(path)
-        if target.stat().st_size > MAX_FILE_BYTES:
-            raise ValueError(f"file exceeds {MAX_FILE_BYTES} byte read limit: {path}")
-        lines = target.read_text(encoding="utf-8").splitlines()
-        selected = lines[start_line - 1 : start_line - 1 + line_count]
-        return "\n".join(f"{index}: {line}" for index, line in enumerate(selected, start_line))
+        # Stream to the requested window rather than sizing up the whole file:
+        # refusing to show ten lines of a large log because the rest of it is
+        # long makes paging through one impossible.
+        selected: list[str] = []
+        budget = MAX_TOOL_OUTPUT
+        truncated = False
+        with target.open(encoding="utf-8") as handle:
+            for index, raw_line in enumerate(handle, 1):
+                if index < start_line:
+                    continue
+                entry = f"{index}: {raw_line.rstrip(chr(10))}"
+                budget -= len(entry) + 1
+                if budget < 0:
+                    truncated = True
+                    break
+                selected.append(entry)
+                if len(selected) >= line_count:
+                    break
+        body = "\n".join(selected)
+        if truncated:
+            body += f"\n[window truncated at {MAX_TOOL_OUTPUT} bytes; continue from a later start_line]"
+        return body
 
     def tool_list_files(self, glob: str = "*") -> str:
         rg = shutil.which("rg")
@@ -651,16 +703,26 @@ class RepositoryTools:
             )
             if result.returncode not in (0, 1):
                 raise ValueError(result.stderr.strip() or "rg --files failed")
-            return result.stdout
+            return self.capped_listing(result.stdout.splitlines())
         matches: list[str] = []
         for path in self.root.rglob("*"):
             if path.is_file():
                 relative = str(path.relative_to(self.root))
                 if fnmatch.fnmatch(relative, glob) or fnmatch.fnmatch(path.name, glob):
                     matches.append(relative)
-                    if len(matches) >= 1000:
+                    if len(matches) > MAX_LIST_ENTRIES:
                         break
-        return "\n".join(matches)
+        return self.capped_listing(matches)
+
+    @staticmethod
+    def capped_listing(entries: list[str]) -> str:
+        """Cap a listing identically whether ripgrep or the fallback produced it."""
+        if len(entries) <= MAX_LIST_ENTRIES:
+            return "\n".join(entries)
+        kept = entries[:MAX_LIST_ENTRIES]
+        return "\n".join(kept) + (
+            f"\n[listing truncated at {MAX_LIST_ENTRIES} entries; narrow the glob]"
+        )
 
     def tool_search_text(self, pattern: str, glob: str = "*") -> str:
         rg = shutil.which("rg")
@@ -681,15 +743,21 @@ class RepositoryTools:
         output: list[str] = []
         size = 0
         batch: list[str] = []
+        started = time.monotonic()
+        exhausted = False
 
         def flush(paths: list[str]) -> bool:
-            """Run one grep over a batch; return False once the output cap is reached."""
-            nonlocal size
+            """Run one grep batch; return False once output or time is spent."""
+            nonlocal size, exhausted
             if not paths:
                 return True
+            remaining = GREP_TOTAL_TIMEOUT - (time.monotonic() - started)
+            if remaining <= 0:
+                exhausted = True
+                return False
             result = run_process(
                 [grep, "-nH", "-I", "-E", "-e", pattern, "--", *paths],
-                cwd=self.root, timeout=GREP_BATCH_TIMEOUT,
+                cwd=self.root, timeout=min(GREP_BATCH_TIMEOUT, remaining),
             )
             if result.returncode not in (0, 1):
                 raise ValueError(result.stderr.strip() or "grep failed")
@@ -714,10 +782,20 @@ class RepositoryTools:
                 batch.append(os.path.join(".", relative))
                 if len(batch) >= GREP_BATCH_SIZE:
                     if not flush(batch):
-                        return "".join(output)
+                        return self.searched(output, exhausted)
                     batch = []
         flush(batch)
-        return "".join(output)
+        return self.searched(output, exhausted)
+
+    @staticmethod
+    def searched(output: list[str], exhausted: bool) -> str:
+        body = "".join(output)
+        if exhausted:
+            body += (
+                f"\n[search stopped after {GREP_TOTAL_TIMEOUT}s; results are partial. "
+                "Narrow the glob or the pattern.]"
+            )
+        return body
 
     def tool_git_status(self) -> str:
         return self.fixed_command(["git", "status", "--short", "--branch"])
@@ -739,8 +817,8 @@ class RepositoryTools:
         if type(expected_occurrences) is not int or not 1 <= expected_occurrences <= 100:
             raise ValueError("expected_occurrences must be between 1 and 100")
         target = self.safe_write_path(path)
-        if target.stat().st_size > MAX_FILE_BYTES:
-            raise ValueError(f"file exceeds {MAX_FILE_BYTES} byte edit limit")
+        if target.stat().st_size > MAX_EDIT_BYTES:
+            raise ValueError(f"file exceeds {MAX_EDIT_BYTES} byte edit limit")
         original = target.read_text(encoding="utf-8")
         actual = original.count(old_text)
         if actual != expected_occurrences:
@@ -748,16 +826,16 @@ class RepositoryTools:
                 f"expected {expected_occurrences} occurrences, found {actual}; no change made"
             )
         replacement = original.replace(old_text, new_text)
-        if len(replacement.encode("utf-8")) > MAX_FILE_BYTES:
-            raise ValueError(f"replacement exceeds {MAX_FILE_BYTES} byte edit limit")
+        if len(replacement.encode("utf-8")) > MAX_EDIT_BYTES:
+            raise ValueError(f"replacement exceeds {MAX_EDIT_BYTES} byte edit limit")
         protected_write(target, replacement, mode=None)
         return f"replaced {actual} occurrence(s) in {target.relative_to(self.root)}"
 
     def tool_write_file(self, path: str, content: str) -> str:
         if not self.write:
             raise ValueError("write tools are disabled")
-        if len(content.encode("utf-8")) > MAX_FILE_BYTES:
-            raise ValueError(f"content exceeds {MAX_FILE_BYTES} byte write limit")
+        if len(content.encode("utf-8")) > MAX_EDIT_BYTES:
+            raise ValueError(f"content exceeds {MAX_EDIT_BYTES} byte write limit")
         target = self.safe_write_path(path, allow_missing=True)
         target.parent.mkdir(parents=True, exist_ok=True)
         protected_write(target, content, mode=None)
@@ -983,8 +1061,8 @@ def main() -> int:
         mission_path = args.mission.resolve(strict=True)
         if not mission_path.is_file():
             fail(f"mission is not a file: {mission_path}")
-        if mission_path.stat().st_size > MAX_FILE_BYTES:
-            fail(f"mission exceeds {MAX_FILE_BYTES} bytes")
+        if mission_path.stat().st_size > MAX_MISSION_BYTES:
+            fail(f"mission exceeds {MAX_MISSION_BYTES} bytes")
         mission = mission_path.read_text(encoding="utf-8")
         system = (
             "You are a bounded repository delegate. Execute only the supplied mission. "
@@ -1136,7 +1214,11 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
             request_started = time.monotonic()
             try:
                 response = client.call("POST", "/chat/completions", payload)
-                event("request_end", duration_seconds=round(time.monotonic() - request_started, 3))
+                step_usage = journal.record_usage(
+                    response.get("usage") if isinstance(response, dict) else None
+                ) if journal else {}
+                event("request_end", duration_seconds=round(time.monotonic() - request_started, 3),
+                      **step_usage)
                 break
             except TransportError as exc:
                 event("request_error", category=str(exc), retryable=exc.retryable)

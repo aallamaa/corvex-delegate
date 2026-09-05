@@ -651,9 +651,9 @@ class FinalAuditFixTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tools.tool_replace_text("file.txt", "", "y", 2)
             with self.assertRaises(ValueError):
-                tools.tool_write_file("file.txt", "x" * (corvee.MAX_FILE_BYTES + 1))
+                tools.tool_write_file("file.txt", "x" * (corvee.MAX_EDIT_BYTES + 1))
             self.assertEqual(path.read_text(), "x")
-            path.write_text("x" * (corvee.MAX_FILE_BYTES + 1))
+            path.write_text("x" * (corvee.MAX_EDIT_BYTES + 1))
             with self.assertRaises(ValueError):
                 tools.tool_replace_text("file.txt", "x", "y")
 
@@ -1869,6 +1869,121 @@ class StallGuardTest(unittest.TestCase):
                     stubborn.chmod(0o700)
             self.assertEqual(summary["removed"], 1)
             self.assertFalse(stubborn.exists())
+
+
+class WindowedReadTest(unittest.TestCase):
+    """A large file must be pageable, not refused."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        (self.root / "big.log").write_text("line\n" * 45_000, encoding="utf-8")
+        self.tools = corvee.RepositoryTools(self.root, False, set())
+
+    def test_a_file_larger_than_the_edit_limit_is_still_readable(self) -> None:
+        self.assertGreater((self.root / "big.log").stat().st_size, corvee.MAX_EDIT_BYTES)
+        result = json.loads(self.tools.execute(
+            "read_file", {"path": "big.log", "start_line": 1, "line_count": 3}
+        ))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"], "1: line\n2: line\n3: line")
+
+    def test_a_window_deep_in_a_large_file_is_reachable(self) -> None:
+        result = json.loads(self.tools.execute(
+            "read_file", {"path": "big.log", "start_line": 44_998, "line_count": 3}
+        ))
+        self.assertTrue(result["ok"], result)
+        self.assertIn("45000: line", result["result"])
+
+    def test_an_oversized_window_is_truncated_with_guidance(self) -> None:
+        (self.root / "wide.txt").write_text(("x" * 500 + "\n") * 400, encoding="utf-8")
+        result = json.loads(self.tools.execute(
+            "read_file", {"path": "wide.txt", "start_line": 1, "line_count": 400}
+        ))
+        self.assertTrue(result["ok"], result)
+        self.assertIn("window truncated", result["result"])
+        self.assertLessEqual(len(result["result"]), corvee.MAX_TOOL_OUTPUT + 200)
+
+    def test_binary_content_still_fails_cleanly(self) -> None:
+        (self.root / "blob.bin").write_bytes(b"\xff\xfe\x00binary")
+        result = json.loads(self.tools.execute("read_file", {"path": "blob.bin"}))
+        self.assertFalse(result["ok"])
+
+
+class ListingCapTest(unittest.TestCase):
+    """The same tool must not behave differently because ripgrep is installed."""
+
+    def test_both_backends_cap_at_the_same_number_of_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for index in range(corvee.MAX_LIST_ENTRIES + 50):
+                (root / f"f{index}.txt").write_text("x", encoding="utf-8")
+            tools = corvee.RepositoryTools(root, False, set())
+            with_rg = json.loads(tools.execute("list_files", {}))
+            real_which = shutil.which
+            with patch.object(corvee.shutil, "which",
+                              lambda name: None if name == "rg" else real_which(name)):
+                without_rg = json.loads(tools.execute("list_files", {}))
+        for listing in (with_rg, without_rg):
+            self.assertTrue(listing["ok"], listing)
+            entries = [line for line in listing["result"].splitlines()
+                       if not line.startswith("[listing truncated")]
+            self.assertLessEqual(len(entries), corvee.MAX_LIST_ENTRIES)
+        self.assertIn("listing truncated", with_rg["result"])
+        self.assertIn("listing truncated", without_rg["result"])
+
+
+class UsageAccountingTest(unittest.TestCase):
+    """The protocol asks the planner to report budget consumed, so the runner
+    has to measure it rather than leave the model to invent a number."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.run_dir = Path(self.directory.name) / "run"
+
+    def journal(self):
+        return corvee.RunJournal(self.run_dir, "secret")
+
+    def test_totals_accumulate_across_requests(self) -> None:
+        journal = self.journal()
+        journal.record_usage({"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120})
+        journal.record_usage({"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55})
+        self.assertEqual(journal.usage["prompt_tokens"], 150)
+        self.assertEqual(journal.usage["completion_tokens"], 25)
+        self.assertEqual(journal.usage["total_tokens"], 175)
+        self.assertEqual(journal.usage["requests"], 2)
+        self.assertTrue(journal.usage["reported_by_provider"])
+
+    def test_a_provider_that_reports_nothing_is_not_counted_as_zero(self) -> None:
+        journal = self.journal()
+        journal.record_usage(None)
+        journal.record_usage({"prompt_tokens": "many"})
+        self.assertEqual(journal.usage["requests"], 2)
+        self.assertEqual(journal.usage["total_tokens"], 0)
+        # The distinction that matters: unmeasured, not measured-as-zero.
+        self.assertFalse(journal.usage["reported_by_provider"])
+
+    def test_status_file_carries_the_totals(self) -> None:
+        journal = self.journal()
+        journal.record_usage({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10})
+        journal.finish("report_returned", 0)
+        status = json.loads((self.run_dir / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["usage"]["total_tokens"], 10)
+        self.assertTrue(status["usage"]["reported_by_provider"])
+
+    def test_run_steps_records_usage_from_the_provider(self) -> None:
+        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        client = corvee.ApiClient("https://example.com", "fake")
+        response = {
+            "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
+        }
+        journal = self.journal()
+        with patch.object(client, "call", return_value=response):
+            corvee.run_steps(client, tools, [], "mock", None, 4, 100, journal=journal)
+        self.assertEqual(journal.usage["total_tokens"], 15)
 
 
 if __name__ == "__main__":

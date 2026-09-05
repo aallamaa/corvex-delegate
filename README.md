@@ -77,6 +77,8 @@ Use `COMMAND --help` for options. `--config PATH` selects another settings file.
 
 Inference requests default to a **600-second** socket timeout (`run --http-timeout`, or `--timeout` for configuration commands). Every duration option accepts plain seconds or a `30s`/`30m`/`2h` suffix. The runner's total `--max-time` remains a hard wall-clock boundary. Between requests it reserves up to 20% of the run budget for reporting, so a shorter run may cap an individual request below 600 seconds.
 
+`status.json` records the token usage the provider reported: `requests`, `prompt_tokens`, `completion_tokens`, `total_tokens`, and `reported_by_provider`. Per-request counts appear on `request_end` in `events.jsonl`. No prices are bundled, and a provider that returns no usage leaves `reported_by_provider` false, which means unmeasured rather than zero. Enforce spending through `--max-steps`, `--max-time`, and iteration budgets.
+
 Each non-dry run creates a new private directory under `.codex/corvee/reports/`, or at `--run-dir PATH` (which must not already exist). It contains metadata-only `events.jsonl`, `status.json`, `report.md`, and an atomic `checkpoint.json` with conversation and tool results. Directories are mode 0700 and files mode 0600. Checkpoints contain repository content: do not publish them or treat key redaction as a comprehensive secret scanner.
 
 To avoid redoing completed work after an interrupted or budget-exhausted run, use `--resume /path/to/run-dir` when rerunning. The runner restores the checkpointed conversation and continues from the next step while preserving prior tool outputs and avoiding duplicate re-execution.
@@ -90,6 +92,8 @@ After failure, inspect `status.json`, `events.jsonl`, and the checkpoint before 
 ## Configuration and data handling
 
 Settings live in `${CODEX_HOME:-~/.codex}/corvee/config.toml`; the key lives beside them in mode-0600 `credentials.toml`. `CORVEX_API_KEY` overrides the stored key. Never paste keys into chat or commit credentials.
+
+Reads are windowed: `read_file` streams to the requested `start_line`, so a large log can be paged rather than refused, and one window returns at most 30 KB. Editing tools still require the whole file to fit in 200 KB. Directory listings cap at 1000 entries and say so, whether ripgrep or the fallback answered. A search stops after 120 seconds across all batches and reports partial results rather than consuming the run budget.
 
 Mission text and tool results are sent to the configured provider. File tools operate inside the selected repository; read-only mode omits editing tools. Commands are disabled unless enabled with `--allow-command`. This is not an OS sandbox or a comprehensive secret scanner: delegate only content you may share and use a sanitized checkout where appropriate. Codex independently verifies returned work.
 

@@ -47,7 +47,7 @@ python3 <skill-dir>/scripts/corvee run \
   --mission /absolute/path/to/mission.md \
   --cwd /absolute/path/to/repository \
   --model exact-provider-model-id \
-  --complexity low --max-steps 16 --max-time 20m
+  --complexity low
 ```
 
 Omit `--write` for analysis and review. Enable it only for authorized edits, and pass `--allow-command NAME` only for needed executables. Command execution is not a security sandbox; interpreters, compilers, and repository scripts can execute arbitrary code. File tools confine paths to the repository but do not guarantee that repository contents are secret-free. Use a sanitized checkout when needed.
@@ -57,6 +57,8 @@ Write tools additionally refuse `.git/` and `.codex/corvee/reports/` after symli
 Allowed executables are resolved at startup; delegate commands must use the exact authorized name or path. Search prefers `rg` and falls back to `grep` with extended regular expressions. The fallback skips hidden entries and symlinks but does not honor `.gitignore`, so ignored private files must be removed from shared checkouts. Linux/macOS wall-clock deadlines interrupt blocked requests and terminate active command process groups; deliberately detached processes are not sandboxed.
 
 After each run, capture the report and exit status, inspect changes, independently rerun decisive checks, and update the ledger with evidence. Exit zero means a report was returned, not that the target passed. Timeouts and missing reports are incomplete work. Never weaken acceptance gates to obtain success.
+
+`--complexity` picks the step and time budget: `low` is 16 steps and 20 minutes, `medium` 32 and 60, `high` 48 and 120. Pass `--max-steps` or `--max-time` only to override one of them.
 
 Requests default to a 600-second timeout within the total run budget. Private run artifacts preserve progress, errors, and checkpoints. On failure or incomplete wrap-up, follow the recovery guidance in [control-protocol.md](references/control-protocol.md) before retrying; prefer `scripts/corvee run --resume <run-dir>` to continue from checkpoint instead of reissuing the same mission from scratch.
 

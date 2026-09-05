@@ -61,6 +61,31 @@ All notable changes to this skill are recorded here. This project follows
 
 ### Changed
 
+- Token usage is measured instead of demanded. The runner discarded the
+  provider's `usage` payload while `control-protocol.md` told the planner to
+  honour a monetary cap and report "budget consumed" — an instruction with no
+  mechanism behind it, which invites invented numbers. `status.json` now
+  carries `requests`, `prompt_tokens`, `completion_tokens`, `total_tokens` and
+  `reported_by_provider`; per-request counts land on `request_end`. A provider
+  that reports nothing leaves the flag false, which means unmeasured, not zero.
+  The docs now say cost caps must be enforced through step, time and iteration
+  budgets, because that is all the runner can actually enforce.
+- `read_file` streams to the requested window instead of sizing up the whole
+  file. A 225 KB log was refused outright even for lines 1-10, which made
+  paging through a large file impossible; a window now returns at most 30 KB,
+  matching what a tool result can carry anyway.
+- `MAX_FILE_BYTES` governed reads, writes, replaces and mission size from one
+  number. Split into `MAX_TOOL_OUTPUT` for read windows, `MAX_EDIT_BYTES` for
+  whole-file edits, `MAX_MISSION_BYTES`, and `MAX_LIST_ENTRIES`.
+- `list_files` capped at 1000 entries only when ripgrep was absent, so the same
+  tool behaved differently per host. Both backends now cap at 1000 and say when
+  they truncated.
+- `search_text` bounds the whole search at 120 seconds, not just each batch. An
+  unbounded batch count could otherwise spend a 20-minute run inside one call.
+- `SKILL.md`'s example passed `--complexity low --max-steps 16 --max-time 20m`,
+  restating the exact preset it had just selected. It now shows the preset and
+  documents what each one means.
+
 - Dead parameters removed from `run_process`: `check` was never `True` and
   `capture_output` never `False` at any of its five call sites, so both are
   gone along with the redundant kwargs each caller repeated.
