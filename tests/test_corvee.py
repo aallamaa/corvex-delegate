@@ -842,7 +842,7 @@ class AuditRegressionTest(unittest.TestCase):
             (root / "sample.txt").write_text("--pre=/usr/bin/printenv\n")
             tools = corvee.RepositoryTools(root, False)
             result = tools.tool_search_text("--pre=/usr/bin/printenv")
-            self.assertIn("sample.txt:1:--pre=/usr/bin/printenv", result)
+            self.assertIn("sample.txt:\n  1: --pre=/usr/bin/printenv", result)
 
     def test_grep_fallback_filters_files_and_skips_symlinks(self):
         if not shutil.which("grep"):
@@ -858,7 +858,7 @@ class AuditRegressionTest(unittest.TestCase):
             tools = corvee.RepositoryTools(root, False)
             with without_ripgrep():
                 result = tools.tool_search_text("alpha[0-9]+", "*.txt")
-                self.assertIn("sample.txt:2:alpha42", result)
+                self.assertIn("sample.txt:\n  2: alpha42", result)
                 self.assertNotIn("skip.py", result)
                 self.assertIn("--pre=marker", tools.tool_search_text("--pre=marker"))
                 self.assertEqual(tools.tool_search_text("outside-secret"), "")
@@ -1220,6 +1220,47 @@ class WriteProtectionTest(unittest.TestCase):
     def test_reads_of_protected_paths_remain_allowed(self) -> None:
         result = json.loads(self.tools.execute("read_file", {"path": ".git/config"}))
         self.assertTrue(result["ok"], result)
+
+
+class SearchGroupingTest(unittest.TestCase):
+    """A search result is re-sent every turn, so the repeated path is dropped."""
+
+    def test_rows_are_grouped_under_one_path_header(self) -> None:
+        raw = "./a/b.py:1:alpha\n./a/b.py:9:beta\n./c.py:3:gamma\n"
+        self.assertEqual(corvee.RepositoryTools.group_matches(raw),
+                         "a/b.py:\n  1: alpha\n  9: beta\nc.py:\n  3: gamma")
+
+    def test_content_containing_colons_is_preserved(self) -> None:
+        raw = "./a.py:7:url = 'http://x:80/p'\n"
+        self.assertEqual(corvee.RepositoryTools.group_matches(raw),
+                         "a.py:\n  7: url = 'http://x:80/p'")
+
+    def test_unparsable_rows_pass_through(self) -> None:
+        # The partial-results notice must survive verbatim.
+        raw = "./a.py:1:hit\n[search stopped after 120s; results are partial.]"
+        out = corvee.RepositoryTools.group_matches(raw)
+        self.assertIn("[search stopped after 120s; results are partial.]", out)
+
+    def test_a_repeated_path_is_only_emitted_once(self) -> None:
+        raw = "".join(f"./same.py:{n}:line{n}\n" for n in range(1, 51))
+        out = corvee.RepositoryTools.group_matches(raw)
+        self.assertEqual(out.count("same.py:"), 1)
+        self.assertLess(len(out), len(raw), "grouping must not grow the result")
+        for n in range(1, 51):
+            self.assertIn(f"  {n}: line{n}", out)
+
+    def test_both_backends_group_identically(self) -> None:
+        if shutil.which("grep") is None:
+            self.skipTest("grep unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "one.txt").write_text("needle a\nx\nneedle b\n", encoding="utf-8")
+            tools = corvee.RepositoryTools(root, False)
+            with_rg = tools.tool_search_text("needle", "*.txt")
+            with without_ripgrep():
+                without_rg = tools.tool_search_text("needle", "*.txt")
+        self.assertEqual(with_rg.strip(), without_rg.strip())
+        self.assertIn("one.txt:", with_rg)
 
 
 class HistoryPruningTest(unittest.TestCase):

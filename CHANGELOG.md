@@ -7,6 +7,14 @@ All notable changes to this skill are recorded here. This project follows
 
 ### Changed
 
+- Search results group their rows under one path header per file instead of
+  repeating the full path on every row, which measured at 22-27% of a search
+  result -- and a result is re-sent on every later turn, so the repetition is
+  billed many times over. Structurally 19-22% smaller; end to end, over eight
+  runs per arm, 35,108 -> 29,314 mean input tokens on a tool-surface mission
+  and no change on a search-heavy one. Both backends emit the identical shape,
+  and a test pins that.
+
 - Token cost per mission cut by about a quarter, measured over eight runs of a
   fixed mission against `zai-org/GLM-5.2-FP8`: mean input 46,302 -> 35,734,
   median 42,504 -> 32,044, with answer quality unchanged (every run still named

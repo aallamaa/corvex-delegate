@@ -812,7 +812,7 @@ class RepositoryTools:
         )
         if result.returncode not in (0, 1):
             raise ValueError(result.stderr.strip() or "rg failed")
-        return result.stdout
+        return self.group_matches(result.stdout)
 
     def grep_search(self, pattern: str, glob: str) -> str:
         grep = shutil.which("grep")
@@ -857,8 +857,32 @@ class RepositoryTools:
         return self.searched(output, exhausted)
 
     @staticmethod
+    def group_matches(text: str) -> str:
+        """Rewrite `path:line:content` rows as one path header per file.
+
+        Both backends repeat the full path on every row, which measured at
+        22-27% of a search result -- and a search result is re-sent on every
+        later turn, so the repetition is billed many times over.
+        """
+        grouped: list[str] = []
+        current = None
+        for row in text.splitlines():
+            path, sep, rest = row.partition(":")
+            number, sep2, body = rest.partition(":")
+            if not (sep and sep2 and number.isdigit()):
+                grouped.append(row)          # notices and anything unparsed
+                current = None
+                continue
+            path = path[2:] if path.startswith("./") else path
+            if path != current:
+                grouped.append(f"{path}:")
+                current = path
+            grouped.append(f"  {number}: {body}")
+        return "\n".join(grouped)
+
+    @staticmethod
     def searched(output: list[str], exhausted: bool) -> str:
-        body = "".join(output)
+        body = RepositoryTools.group_matches("".join(output))
         if exhausted:
             body += (
                 f"\n[search stopped after {GREP_TOTAL_TIMEOUT}s; results are partial. "
