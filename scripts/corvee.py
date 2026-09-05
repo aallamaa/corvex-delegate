@@ -47,17 +47,26 @@ class ProviderFailure(Exception):
 
 class RunJournal:
     """Private checkpoints contain repository content; events contain metadata only."""
-    def __init__(self, directory: Path, api_key: str):
+    def __init__(self, directory: Path, api_key: str, *, resume: bool = False):
         self.directory = directory
-        directory.mkdir(parents=True, mode=0o700, exist_ok=False)
+        if resume:
+            if not directory.exists():
+                raise OSError(f"run directory does not exist: {directory}")
+            if not directory.is_dir():
+                raise OSError(f"run path is not a directory: {directory}")
+            self.events = directory / "events.jsonl"
+            if not self.events.exists():
+                self.events.touch(mode=0o600, exist_ok=True)
+        else:
+            directory.mkdir(parents=True, mode=0o700, exist_ok=False)
+            self.events = directory / "events.jsonl"
+            self.events.touch(mode=0o600, exist_ok=False)
         self.api_key = api_key
         self.started = time.monotonic()
         self.step = 0
         self.messages = []
         self.phase = "starting"
-        self.events = directory / "events.jsonl"
-        self.events.touch(mode=0o600, exist_ok=False)
-
+        self.run_context: dict[str, Any] | None = None
     def redact(self, text: str) -> str:
         return text.replace(self.api_key, "[REDACTED]") if self.api_key else text
 
@@ -73,9 +82,17 @@ class RunJournal:
     def checkpoint(self, messages, phase: str):
         self.messages = messages
         self.phase = phase
-        protected_write(self.directory / "checkpoint.json", self.redact(json.dumps({
-            "version": 1, "step": self.step, "phase": phase, "messages": messages,
+        checkpoint_data = {
+            "version": 1,
+            "step": self.step,
+            "phase": phase,
+            "messages": messages,
             "automatic_replay_safe": False,
+        }
+        if self.run_context is not None:
+            checkpoint_data["run_context"] = self.run_context
+        protected_write(self.directory / "checkpoint.json", self.redact(json.dumps({
+            **checkpoint_data
         }, ensure_ascii=False)))
 
     def finish(self, status: str, code: int):
@@ -90,6 +107,96 @@ class RunJournal:
                             f"Last step: {self.step}; phase: {self.phase}.\n"
                             "No final model report was received. Inspect checkpoint.json and events.jsonl. "
                             "Do not replay pending tools without checking repository state.\n")
+
+
+def _load_checkpoint_messages(
+    run_dir: Path,
+) -> tuple[list[dict[str, Any]], int, str, bool, dict[str, Any]]:
+    """Load messages from an existing checkpoint and return (messages, next_step, phase, pending_trimmed, run_context)."""
+    checkpoint_path = run_dir / "checkpoint.json"
+    try:
+        payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        fail(f"resume failed: cannot read checkpoint {checkpoint_path}: {exc}")
+    except json.JSONDecodeError as exc:
+        fail(f"resume failed: invalid checkpoint format in {checkpoint_path}: {exc}")
+    if not isinstance(payload, dict):
+        fail(f"resume failed: invalid checkpoint format in {checkpoint_path}")
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list):
+        fail(f"resume failed: checkpoint messages must be a list in {checkpoint_path}")
+    if not all(isinstance(message, dict) for message in messages):
+        fail(f"resume failed: checkpoint contains malformed messages in {checkpoint_path}")
+    if not messages:
+        fail(f"resume failed: checkpoint has no messages in {checkpoint_path}")
+    if messages and messages[0].get("role") != "system":
+        fail(f"resume failed: checkpoint missing expected system prompt in {checkpoint_path}")
+
+    raw_context = payload.get("run_context", {})
+    if not isinstance(raw_context, dict):
+        fail(f"resume failed: invalid checkpoint run_context in {checkpoint_path}")
+    run_context: dict[str, Any] = {}
+    if "cwd" in raw_context:
+        cwd = raw_context["cwd"]
+        if not isinstance(cwd, str) or not cwd.strip():
+            fail(f"resume failed: invalid checkpoint run_context.cwd in {checkpoint_path}")
+        run_context["cwd"] = cwd
+    if "write" in raw_context:
+        write = raw_context["write"]
+        if not isinstance(write, bool):
+            fail(f"resume failed: invalid checkpoint run_context.write in {checkpoint_path}")
+        run_context["write"] = write
+    if "allowed_commands" in raw_context:
+        commands = raw_context["allowed_commands"]
+        if not isinstance(commands, list) or not all(isinstance(command, str) for command in commands):
+            fail(f"resume failed: invalid checkpoint run_context.allowed_commands in {checkpoint_path}")
+        run_context["allowed_commands"] = sorted(set(commands))
+
+    phase = str(payload.get("phase", ""))
+    step = payload.get("step", 0)
+    try:
+        step = int(step)
+    except (TypeError, ValueError):
+        step = 0
+    if step < 0:
+        step = 0
+    if phase in {"ready", "request_pending"}:
+        next_step = step
+    else:
+        next_step = step + 1
+    if next_step < 1:
+        next_step = 1
+
+    messages_copy = messages.copy()
+    pending_trimmed = False
+    index = len(messages_copy) - 1
+    while index >= 0 and messages_copy[index].get("role") == "tool":
+        index -= 1
+    if index >= 0:
+        assistant = messages_copy[index]
+        if assistant.get("role") == "assistant" and isinstance(assistant.get("tool_calls"), list):
+            tool_calls = assistant.get("tool_calls") or []
+            if tool_calls:
+                expected: set[str] = set()
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        fail(f"resume failed: checkpoint has malformed tool call in {checkpoint_path}")
+                    call_id = tool_call.get("id")
+                    if not isinstance(call_id, str):
+                        fail(f"resume failed: checkpoint has tool calls without IDs in {checkpoint_path}")
+                    expected.add(call_id)
+                responses = {
+                    str(message.get("tool_call_id"))
+                    for message in messages_copy[index + 1:]
+                    if isinstance(message, dict) and message.get("role") == "tool"
+                }
+                if expected - responses:
+                    messages_copy = messages_copy[:index]
+                    pending_trimmed = True
+
+    if pending_trimmed and not messages_copy:
+        fail(f"resume failed: checkpoint ends with an unterminated tool call in {checkpoint_path}")
+    return messages_copy, next_step, phase, pending_trimmed, run_context
 
 
 def fail(message: str, code: int = 2) -> None:
@@ -111,6 +218,153 @@ def parse_duration(value: str) -> int:
     if not number.isdigit() or int(number) < 1:
         raise argparse.ArgumentTypeError("expected a positive duration such as 30m")
     return int(number) * multiplier
+
+
+def _get_report_dir_mtime(directory: Path) -> float:
+    latest = directory.stat().st_mtime
+    try:
+        for item in directory.rglob("*"):
+            try:
+                if item.is_symlink():
+                    continue
+                mtime = item.stat().st_mtime
+                if mtime > latest:
+                    latest = mtime
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return latest
+
+
+KNOWN_REPORT_ARTIFACTS = {"checkpoint.json", "events.jsonl", "status.json", "report.md"}
+
+
+def _is_uuid_hex(name: str) -> bool:
+    if len(name) != 32:
+        return False
+    try:
+        val = uuid.UUID(hex=name)
+        return val.hex == name.lower()
+    except ValueError:
+        return False
+
+
+def _is_report_candidate(entry: Path) -> bool:
+    if _is_uuid_hex(entry.name):
+        return True
+    for artifact in KNOWN_REPORT_ARTIFACTS:
+        if (entry / artifact).exists():
+            return True
+    return False
+
+
+def _force_remove_tree(path: Path) -> None:
+    path = Path(path)
+    try:
+        st = path.lstat()
+    except OSError:
+        return
+    if path.is_symlink() or not stat.S_ISDIR(st.st_mode):
+        path.unlink()
+        return
+
+    try:
+        os.chmod(path, stat.S_IRWXU)
+    except OSError:
+        pass
+    entries: list[Path] = []
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        pass
+    for child in entries:
+        _force_remove_tree(child)
+    os.rmdir(path)
+
+
+def _remove_readonly_onexc(func: Any, path: Any, exc: Any) -> None:
+    del func, exc
+    _force_remove_tree(Path(path))
+
+
+def _remove_report_dir(directory: Path) -> None:
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(directory, onexc=_remove_readonly_onexc)
+    else:
+        shutil.rmtree(directory, onerror=_remove_readonly_onexc)
+
+
+def cleanup_reports(
+    reports_root: Path,
+    *,
+    older_than_days: int = 30,
+    dry_run: bool = False,
+) -> dict[str, int | str | bool]:
+    """Remove stale report artifacts and return a result summary."""
+    if older_than_days < 1:
+        raise ValueError("older_than_days must be positive")
+    result = {
+        "removed": 0,
+        "kept": 0,
+        "skipped": 0,
+        "failed": 0,
+        "mode": "dry-run" if dry_run else "delete",
+        "path": str(reports_root),
+    }
+    if not reports_root.exists():
+        print(f"[corvée] No report directory found: {reports_root}")
+        return result
+    if not reports_root.is_dir():
+        print(f"[corvée] Report path is not a directory: {reports_root}")
+        return {**result, "failed": result["failed"] + 1}
+    now = time.time()
+    cutoff = now - older_than_days * 24 * 60 * 60
+    print(f"[corvée] Report root: {reports_root}")
+    print(f"[corvée] Keeping items newer than {older_than_days} day(s)")
+    try:
+        entries = sorted(reports_root.iterdir())
+    except OSError as exc:
+        print(f"[corvée] Failed to read report directory {reports_root}: {exc}")
+        return {**result, "failed": result["failed"] + 1}
+    for entry in entries:
+        if entry.is_symlink():
+            print(f"SKIP: {entry.name} (symlink)")
+            result["skipped"] += 1
+            continue
+        if not entry.is_dir():
+            print(f"SKIP: {entry.name} (not a directory)")
+            result["skipped"] += 1
+            continue
+        if not _is_report_candidate(entry):
+            print(f"SKIP: {entry.name} (not a report candidate)")
+            result["skipped"] += 1
+            continue
+        try:
+            mtime = _get_report_dir_mtime(entry)
+        except OSError:
+            print(f"SKIP: {entry.name} (stat failed)")
+            result["skipped"] += 1
+            continue
+        age_days = (now - mtime) / (24 * 60 * 60)
+        if mtime <= cutoff:
+            if dry_run:
+                print(f"DELETE [dry-run]: {entry.name} ({age_days:.1f}d old)")
+                result["removed"] += 1
+                continue
+            try:
+                _remove_report_dir(entry)
+                print(f"DELETED: {entry.name} ({age_days:.1f}d old)")
+                result["removed"] += 1
+            except OSError as exc:
+                print(f"FAILED: {entry.name} ({exc})")
+                result["failed"] += 1
+        else:
+            print(f"KEEP: {entry.name} ({age_days:.1f}d old)")
+            result["kept"] += 1
+    print("[corvée] Summary:", json.dumps(result, ensure_ascii=False))
+    return result
+
 
 
 def truncate(value: str, limit: int = MAX_TOOL_OUTPUT) -> str:
@@ -559,6 +813,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-retries", type=int, default=1,
                         help="Transient request retries (0-2); may incur duplicate inference charges")
     parser.add_argument("--run-dir", type=Path, help="New private artifact directory; must not exist")
+    parser.add_argument("--resume", type=Path, help="Resume from an existing run directory")
     parser.add_argument("--models", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -643,8 +898,8 @@ def main() -> int:
 
     if not model:
         fail("Select a Corvex model with $corvee select or pass --model")
-    if args.mission is None:
-        fail("--mission is required unless --models is used")
+    if args.mission is None and not args.resume:
+        fail("--mission is required unless --resume is used")
     if args.max_steps is not None and args.max_steps < 1:
         fail("--max-steps must be positive")
     if args.http_timeout < 1:
@@ -667,12 +922,54 @@ def main() -> int:
     root = args.cwd.resolve(strict=True)
     if not root.is_dir():
         fail(f"working directory is not a directory: {root}")
-    mission_path = args.mission.resolve(strict=True)
-    if not mission_path.is_file():
-        fail(f"mission is not a file: {mission_path}")
-    if mission_path.stat().st_size > MAX_FILE_BYTES:
-        fail(f"mission exceeds {MAX_FILE_BYTES} bytes")
-    mission = mission_path.read_text(encoding="utf-8")
+    resume_context: dict[str, Any] = {}
+
+    resume_dir = args.resume.expanduser().resolve() if args.resume else None
+    if args.resume and args.run_dir and args.run_dir.expanduser().resolve() != resume_dir:
+        fail("--run-dir must match --resume when resuming")
+
+    run_dir = (resume_dir if resume_dir else (
+        args.run_dir.expanduser().resolve() if args.run_dir
+        else root / ".codex" / "corvee" / "reports" / uuid.uuid4().hex
+    ))
+    start_step = 1
+    resume_phase = ""
+    tool_pending_trimmed = False
+
+    if args.resume:
+        messages, start_step, resume_phase, tool_pending_trimmed, resume_context = _load_checkpoint_messages(run_dir)
+        if tool_pending_trimmed and start_step > 1:
+            start_step -= 1
+        if "cwd" in resume_context and Path(resume_context["cwd"]).resolve() != root:
+            fail("resume failed: checkpoint was started from a different --cwd; rerun with matching --cwd")
+        if "write" in resume_context and resume_context["write"] != args.write:
+            fail("resume failed: resume used mismatched --write mode")
+        if "allowed_commands" in resume_context:
+            if sorted(set(args.allow_command)) != resume_context["allowed_commands"]:
+                fail("resume failed: resume used mismatched --allow-command list")
+    else:
+        mission_path = args.mission.resolve(strict=True)
+        if not mission_path.is_file():
+            fail(f"mission is not a file: {mission_path}")
+        if mission_path.stat().st_size > MAX_FILE_BYTES:
+            fail(f"mission exceeds {MAX_FILE_BYTES} bytes")
+        mission = mission_path.read_text(encoding="utf-8")
+        system = (
+            "You are a bounded repository delegate. Execute only the supplied mission. "
+            "Use tools to inspect evidence before conclusions. Do not expand scope, access credentials, "
+            "commit, push, release, or perform production operations. "
+            + (
+                "Repository writes are authorized only within the mission scope. "
+                if args.write
+                else "This is read-only: do not request or claim repository edits. "
+            )
+            + "Finish with a concise evidence report listing files changed, checks performed, failures, "
+            "uncertainties, and whether the bounded objective is complete."
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Repository root: {root}\n\nMission:\n{mission}"},
+        ]
     tools = RepositoryTools(root, args.write, set(args.allow_command))
 
     run_description = {
@@ -685,40 +982,54 @@ def main() -> int:
         "max_time_seconds": max_time,
         "api_key_env": api_key_env,
         "api_key_present": True,
+        "cwd": str(root),
+        "run_context": {
+            "cwd": str(root),
+            "write": bool(args.write),
+            "allowed_commands": sorted(set(args.allow_command)),
+            "http_timeout": args.http_timeout,
+        },
     }
+    if args.resume:
+        run_description["resume_from"] = str(run_dir)
     print(json.dumps(run_description, indent=2), file=sys.stderr)
     if args.dry_run:
         return 0
 
-    system = (
-        "You are a bounded repository delegate. Execute only the supplied mission. "
-        "Use tools to inspect evidence before conclusions. Do not expand scope, access credentials, "
-        "commit, push, release, or perform production operations. "
-        + (
-            "Repository writes are authorized only within the mission scope. "
-            if args.write
-            else "This is read-only: do not request or claim repository edits. "
+    if args.resume and tool_pending_trimmed:
+        messages.append(
+            {"role": "user", "content":
+             "The prior run ended while a tool call was pending. Do not replay pending tool calls."
+             " Verify repository state and continue from here with the existing evidence."}
         )
-        + "Finish with a concise evidence report listing files changed, checks performed, failures, "
-        "uncertainties, and whether the bounded objective is complete."
-    )
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": f"Repository root: {root}\n\nMission:\n{mission}"},
-    ]
-    directory = (args.run_dir.expanduser().resolve() if args.run_dir else
-                 root / ".codex" / "corvee" / "reports" / uuid.uuid4().hex)
+    directory = run_dir
     try:
-        journal = RunJournal(directory, api_key)
+        journal = RunJournal(directory, api_key, resume=bool(args.resume))
     except OSError as exc:
+        if args.resume:
+            fail(f"cannot open private run directory: {exc}")
         fail(f"cannot create private run directory: {exc}")
     print(f"Run artifacts: {directory}", file=sys.stderr, flush=True)
-    journal.checkpoint(messages, "ready")
-    journal.event("run_start", model=model, max_steps=max_steps, max_time_seconds=max_time)
+    journal.run_context = run_description["run_context"]
+    if args.resume and resume_context:
+        journal.run_context["cwd"] = resume_context.get("cwd", journal.run_context["cwd"])
+        if "write" in resume_context:
+            journal.run_context["write"] = resume_context["write"]
+        if "allowed_commands" in resume_context:
+            journal.run_context["allowed_commands"] = resume_context["allowed_commands"]
+    if not args.resume:
+        journal.checkpoint(messages, "ready")
+    else:
+        journal.step = max(1, start_step - 1)
+        journal.messages = messages
+        journal.phase = resume_phase or "resumed"
+        journal.event("run_resume", resume_from=str(directory), from_phase=journal.phase, start_step=start_step)
+    journal.event("run_start", model=model, max_steps=max_steps, max_time_seconds=max_time,
+                 start_step=start_step, resumed=bool(args.resume))
     try:
         with execution_deadline(max_time):
             code = run_steps(client, tools, messages, model, args.effort, max_steps, max_time,
-                             journal=journal, request_retries=args.request_retries)
+                             journal=journal, request_retries=args.request_retries, start_step=start_step)
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
         journal.finish("budget_exhausted" if code == 124 else "failed", code)
@@ -734,7 +1045,7 @@ def main() -> int:
 
 
 def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
-              journal=None, request_retries=1):
+              journal=None, request_retries=1, start_step=1):
     started = time.monotonic()
     deadline = started + max_time
     request_timeout = client.timeout
@@ -742,7 +1053,10 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
     repeated = {}
     error_streak = 0
     stop_reason = None
+    wrap_up_announced = False
     allowed_names = {tool["function"]["name"] for tool in tools.schemas()}
+    start_step = max(1, int(start_step))
+    end_step = start_step + max_steps - 1
 
     def event(name, **fields):
         if journal:
@@ -752,18 +1066,19 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
         if journal:
             journal.checkpoint(messages, phase)
 
-    for step in range(1, max_steps + 1):
+    for step in range(start_step, end_step + 1):
         if journal:
             journal.step = step
         if time.monotonic() - started >= max_time:
             fail(f"delegate exceeded max time after {step - 1} steps", 124)
-        if stop_reason is None and (step == max_steps or deadline - time.monotonic() <= reserve):
-            stop_reason = "step_budget" if step == max_steps else "time_reserve"
-        if stop_reason:
+        if stop_reason is None and (step == end_step or deadline - time.monotonic() <= reserve):
+            stop_reason = "step_budget" if step == end_step else "time_reserve"
+        if stop_reason and not wrap_up_announced:
             messages.append({"role": "user", "content":
                 f"Execution stopped ({stop_reason}). Tools are disabled. Return a concise partial "
                 "evidence report now, including uncertainties and unverified work. Do not claim completion."})
             event("wrap_up", reason=stop_reason)
+            wrap_up_announced = True
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -802,6 +1117,8 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
                 event("request_retry", delay_seconds=delay)
                 time.sleep(delay)
         if response is None:
+            if stop_reason:
+                fail("delegate exceeded max time while waiting for final wrap-up", 124)
             continue
         if time.monotonic() - started >= max_time:
             fail("delegate exceeded max time", 124)

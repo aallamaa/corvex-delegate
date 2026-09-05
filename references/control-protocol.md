@@ -100,7 +100,7 @@ Execute exactly one controlled iteration:
 
 Use a fresh direct-runner context for each mission. A failed or timed-out run may have left partial edits; inspect before retrying. Capture the report and exit status in `reports/`. Do not include credential values or environment dumps.
 
-The runner now creates a private per-run artifact directory automatically; use `--run-dir` to name a new directory explicitly. Read metadata in `events.jsonl` and `status.json` first. `checkpoint.json` preserves conversation/tool results and may contain private repository content. Inspect it locally as needed; do not paste it wholesale into chat or a new mission. Never replay a `tool_pending` operation without verifying whether its effects already occurred.
+The runner creates a private per-run artifact directory automatically; use `--run-dir` to name a new directory explicitly. Read metadata in `events.jsonl` and `status.json` first. `checkpoint.json` preserves conversation/tool results and may contain private repository content. Inspect it locally as needed; do not paste it wholesale into chat or a new mission. Use `scripts/corvee run --resume <run-dir>` to continue from the latest checkpoint when safe, and keep `tool_pending` behavior conservative.
 
 Request timeouts default to 600 seconds; retain that allowance for slow models unless the user requests less. The total run budget still wins. A transient request can retry once (up to two with `--request-retries 2`), with possible duplicate provider charges, but completed local tools are not rerun. Do not restart an entire mission merely because one inference request timed out.
 

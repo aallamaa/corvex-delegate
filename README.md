@@ -66,7 +66,9 @@ python3 scripts/corvee models
 python3 scripts/corvee select exact-provider-model-id
 python3 scripts/corvee show
 python3 scripts/corvee check
+python3 scripts/corvee cleanup --older-than-days 30
 python3 scripts/corvee run --mission /path/mission.md --cwd /path/repo --max-time 20m
+python3 scripts/corvee run --resume /path/repo/.codex/corvee/reports/<run-id> --max-steps 8 --max-time 15m
 ```
 
 Use `COMMAND --help` for options. `--config PATH` selects another settings file. Target planning, audit, and loops are interpreted by Codex; the CLI runs individual missions, not the entire orchestration workflow.
@@ -77,11 +79,13 @@ Inference requests default to a **600-second** socket timeout (`run --http-timeo
 
 Each non-dry run creates a new private directory under `.codex/corvee/reports/`, or at `--run-dir PATH` (which must not already exist). It contains metadata-only `events.jsonl`, `status.json`, `report.md`, and an atomic `checkpoint.json` with conversation and tool results. Directories are mode 0700 and files mode 0600. Checkpoints contain repository content: do not publish them or treat key redaction as a comprehensive secret scanner.
 
+To avoid redoing completed work after an interrupted or budget-exhausted run, use `--resume /path/to/run-dir` when rerunning. The runner restores the checkpointed conversation and continues from the next step while preserving prior tool outputs and avoiding duplicate re-execution.
+
 One transient API retry is allowed by default; `--request-retries 0` disables retries and `2` is the maximum. Retries may incur duplicate inference charges, stay within the original time budget, and never replay completed local tools. Authentication errors and invalid JSON are not retried.
 
 Repeated identical tool results or consecutive errors trigger a warning, then a tools-disabled wrap-up. The last model step is also reserved for reporting. A forced wrap-up is incomplete even when a report arrives. Exit codes: `0` report returned (not verified success), `3` incomplete wrap-up, `75` transient provider failure after retries, `124` budget exhausted, `130` interrupted, `1` other failure.
 
-After failure, inspect `status.json`, `events.jsonl`, and the checkpoint before preparing a smaller follow-up mission. A `tool_pending` checkpoint means execution may have partially happened: inspect repository state before retrying. Automatic checkpoint resume/replay is deliberately not provided. Hard interruptions such as SIGKILL cannot finalize status; use the last durable checkpoint as incomplete evidence.
+After failure, inspect `status.json`, `events.jsonl`, and the checkpoint before preparing a smaller follow-up mission. A `tool_pending` checkpoint means execution may have partially happened: inspect repository state before continuing. Use `--resume` to continue from the same run directory when safe. Hard interruptions such as SIGKILL cannot finalize status; use the last durable checkpoint as incomplete evidence.
 
 ## Configuration and data handling
 

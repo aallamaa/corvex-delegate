@@ -12,6 +12,7 @@ import unittest
 import sys
 import shutil
 import time
+import uuid
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
@@ -388,6 +389,61 @@ class CorveeTest(unittest.TestCase):
             )
             self.assertIn("Model: not selected", shown_auto.stdout)
 
+    def test_wrapper_run_accepts_timeout_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mission = root / "mission.md"
+            mission.write_text("No-op.\n", encoding="utf-8")
+            environment = {"CORVEX_API_KEY": "test-secret", "CORVEX_MODEL": "mock"}
+            shared_timeout_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI),
+                    "--timeout",
+                    "1s",
+                    "run",
+                    "--no-config",
+                    "--mission",
+                    str(mission),
+                    "--cwd",
+                    str(root),
+                    "--model",
+                    "mock",
+                    "--dry-run",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(shared_timeout_result.returncode, 0)
+            self.assertNotIn("unknown option", shared_timeout_result.stderr + shared_timeout_result.stdout)
+            self.assertIn('"http_timeout\": 1', shared_timeout_result.stdout + shared_timeout_result.stderr)
+
+            post_command_timeout_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI),
+                    "run",
+                    "--timeout",
+                    "1s",
+                    "--no-config",
+                    "--mission",
+                    str(mission),
+                    "--cwd",
+                    str(root),
+                    "--model",
+                    "mock",
+                    "--dry-run",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(post_command_timeout_result.returncode, 0)
+            self.assertNotIn("unrecognized arguments: --timeout 1s", post_command_timeout_result.stderr + post_command_timeout_result.stdout)
+            self.assertNotIn("unknown option", post_command_timeout_result.stderr + post_command_timeout_result.stdout)
+            self.assertIn('"http_timeout\": 1', post_command_timeout_result.stdout + post_command_timeout_result.stderr)
+
     def test_installer_validates_before_finalizing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             codex_home = Path(directory) / "codex"
@@ -650,6 +706,120 @@ class RunnerRecoveryTest(unittest.TestCase):
         self.assertEqual(execute.call_count, 3)
         self.assertEqual(call.call_args.args[2]["tool_choice"], "none")
 
+    def test_resume_checkpoint_trims_unmatched_tool_batch_and_preserves_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+            (run_dir / "checkpoint.json").write_text(json.dumps({
+                "version": 1,
+                "step": 2,
+                "phase": "tool_batch",
+                "run_context": {
+                    "cwd": str(run_dir / "repo"),
+                    "write": False,
+                    "allowed_commands": ["echo"],
+                },
+                "messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "run"},
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                        {"id": "2", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                    ]},
+                    {"role": "tool", "tool_call_id": "1", "content": "{\"ok\":true}"},
+                ],
+            }, ensure_ascii=False))
+            messages, next_step, phase, trimmed, context = corvee._load_checkpoint_messages(run_dir)
+            self.assertTrue(trimmed)
+            self.assertEqual(next_step, 3)
+            self.assertEqual(phase, "tool_batch")
+            self.assertEqual(messages, [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "run"},
+            ])
+            self.assertEqual(context["cwd"], str(run_dir / "repo"))
+            self.assertFalse(context["write"])
+            self.assertEqual(context["allowed_commands"], ["echo"])
+
+    def test_resume_rejects_mismatched_run_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+            (run_dir / "checkpoint.json").write_text(json.dumps({
+                "version": 1,
+                "step": 1,
+                "phase": "ready",
+                "run_context": {
+                    "cwd": str(Path(directory) / "original"),
+                    "write": False,
+                    "allowed_commands": ["echo"],
+                },
+                "messages": [{"role": "system", "content": "s"}],
+            }, ensure_ascii=False))
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--no-config",
+                    "--resume",
+                    str(run_dir),
+                    "--cwd",
+                    directory,
+                    "--model",
+                    "mock",
+                    "--dry-run",
+                ],
+                env={"CORVEX_API_KEY": "test-secret", "CORVEX_MODEL": "mock"},
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("different --cwd", result.stderr + result.stdout)
+
+    def test_resume_reloads_request_pending_step(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+            checkpoint_path = run_dir / "checkpoint.json"
+            checkpoint_path.write_text(json.dumps({
+                "version": 1,
+                "step": 5,
+                "phase": "request_pending",
+                "messages": [
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": "u"},
+                ],
+                "run_context": {
+                    "cwd": str(Path(directory)),
+                    "write": False,
+                    "allowed_commands": [],
+                },
+            }, ensure_ascii=False))
+            loaded_messages, next_step, phase, pending_trimmed, context = corvee._load_checkpoint_messages(run_dir)
+            self.assertFalse(pending_trimmed)
+            self.assertEqual(next_step, 5)
+            self.assertEqual(phase, "request_pending")
+            self.assertEqual(loaded_messages, [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+            ])
+            self.assertEqual(context["cwd"], str(Path(directory)))
+
+    def test_wrap_up_message_is_single_when_time_reserve_exhausted(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        client = corvee.ApiClient("https://example.com", "fake")
+        messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+        with patch.object(client, "call", return_value=None), patch.object(corvee.time, "monotonic", side_effect=lambda: 0.9), patch.object(corvee.time, "sleep"):
+            with self.assertRaises(SystemExit) as error:
+                corvee.run_steps(client, tools, messages, "mock", None, 3, 1)
+        self.assertEqual(error.exception.code, 124)
+        wraps = [
+            message
+            for message in messages
+            if message.get("role") == "user" and "Execution stopped" in message.get("content", "")
+        ]
+        self.assertEqual(len(wraps), 1)
+
     def test_private_checkpoint_preserves_partial_results_and_redacts_key(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = corvee.RunJournal(Path(directory) / "run", "fake-secret")
@@ -789,6 +959,254 @@ class AuditRegressionTest(unittest.TestCase):
         self.assertEqual(error.exception.code, 124)
         self.assertEqual(execute.call_count, 1)
         self.assertLess(time.monotonic() - started, 1)
+
+
+class CleanupTest(unittest.TestCase):
+    def test_cleanup_older_than_days_and_dry_run_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reports_root = Path(directory)
+            now = time.time()
+            old_dir = reports_root / uuid.uuid4().hex
+            old_dir.mkdir()
+            f1 = old_dir / "report.md"
+            f1.touch()
+            os.utime(f1, (now - 40 * 86400, now - 40 * 86400))
+            os.utime(old_dir, (now - 40 * 86400, now - 40 * 86400))
+
+            new_dir = reports_root / uuid.uuid4().hex
+            new_dir.mkdir()
+            f2 = new_dir / "report.md"
+            f2.touch()
+            os.utime(f2, (now - 5 * 86400, now - 5 * 86400))
+            os.utime(new_dir, (now - 5 * 86400, now - 5 * 86400))
+
+            dry_run_summary = corvee.cleanup_reports(reports_root, older_than_days=30, dry_run=True)
+            self.assertEqual(dry_run_summary["removed"], 1)
+            self.assertEqual(dry_run_summary["kept"], 1)
+            self.assertEqual(dry_run_summary["skipped"], 0)
+            self.assertEqual(dry_run_summary["failed"], 0)
+            self.assertTrue(old_dir.exists())
+            self.assertTrue(new_dir.exists())
+
+            real_summary = corvee.cleanup_reports(reports_root, older_than_days=30, dry_run=False)
+            self.assertEqual(real_summary["removed"], 1)
+            self.assertEqual(real_summary["kept"], 1)
+            self.assertEqual(real_summary["failed"], 0)
+            self.assertFalse(old_dir.exists())
+            self.assertTrue(new_dir.exists())
+
+    def test_cleanup_skips_non_report_directory_without_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reports_root = Path(directory)
+            now = time.time()
+            non_report = reports_root / "non_report_dir_uuid_12345"
+            non_report.mkdir()
+            f = non_report / "other_file.txt"
+            f.write_text("data")
+            os.utime(f, (now - 40 * 86400, now - 40 * 86400))
+            os.utime(non_report, (now - 40 * 86400, now - 40 * 86400))
+
+            summary = corvee.cleanup_reports(reports_root, older_than_days=30, dry_run=False)
+            self.assertEqual(summary["skipped"], 1)
+            self.assertEqual(summary["removed"], 0)
+            self.assertTrue(non_report.exists())
+
+    def test_cleanup_deletes_marker_only_report_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reports_root = Path(directory)
+            now = time.time()
+            marker_dir = reports_root / "custom_report_name"
+            marker_dir.mkdir()
+            f = marker_dir / "status.json"
+            f.write_text('{"status":"ok"}')
+            os.utime(f, (now - 40 * 86400, now - 40 * 86400))
+            os.utime(marker_dir, (now - 40 * 86400, now - 40 * 86400))
+
+            summary = corvee.cleanup_reports(reports_root, older_than_days=30, dry_run=False)
+            self.assertEqual(summary["removed"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertFalse(marker_dir.exists())
+
+    def test_cleanup_permission_restricted_read_only_subdirectory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reports_root = Path(directory)
+            now = time.time()
+            old_dir = reports_root / uuid.uuid4().hex
+            old_dir.mkdir()
+            marker = old_dir / "checkpoint.json"
+            marker.write_text("{}")
+            os.utime(marker, (now - 40 * 86400, now - 40 * 86400))
+            protected = old_dir / "protected"
+            protected.mkdir()
+            protected_file = protected / "read_only.txt"
+            protected_file.write_text("protected")
+            os.utime(protected_file, (now - 40 * 86400, now - 40 * 86400))
+            os.utime(protected, (now - 40 * 86400, now - 40 * 86400))
+            os.chmod(protected, 0o100)
+            os.utime(old_dir, (now - 40 * 86400, now - 40 * 86400))
+
+            summary = corvee.cleanup_reports(reports_root, older_than_days=30, dry_run=False)
+            self.assertEqual(summary["removed"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertFalse(old_dir.exists())
+
+    def test_cleanup_symlink_target_permissions_are_not_mutated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reports_root = Path(directory) / "reports"
+            reports_root.mkdir()
+            external_root = Path(directory) / "external"
+            external_root.mkdir()
+            external_file = external_root / "outside.txt"
+            external_file.write_text("outside", encoding="utf-8")
+            external_file.chmod(0o400)
+            external_mode = external_file.stat().st_mode & 0o777
+
+            now = time.time()
+            old_dir = reports_root / uuid.uuid4().hex
+            old_dir.mkdir()
+            marker = old_dir / "checkpoint.json"
+            marker.write_text("{}")
+            os.symlink(external_file, old_dir / "outside.txt")
+            os.utime(marker, (now - 40 * 86400, now - 40 * 86400))
+            os.utime(old_dir, (now - 40 * 86400, now - 40 * 86400))
+
+            summary = corvee.cleanup_reports(reports_root, older_than_days=30, dry_run=False)
+            self.assertEqual(summary["removed"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertFalse(old_dir.exists())
+            self.assertTrue(external_file.exists())
+            self.assertEqual(external_file.stat().st_mode & 0o777, external_mode)
+
+    def test_cleanup_permission_restricted_read_only_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reports_root = Path(directory)
+            now = time.time()
+            old_dir = reports_root / uuid.uuid4().hex
+            old_dir.mkdir()
+            f1 = old_dir / "checkpoint.json"
+            f1.write_text("{}")
+            os.utime(f1, (now - 40 * 86400, now - 40 * 86400))
+            ro_file = old_dir / "read_only.txt"
+            ro_file.write_text("protected")
+            os.utime(ro_file, (now - 40 * 86400, now - 40 * 86400))
+            os.chmod(ro_file, 0o400)
+            os.utime(old_dir, (now - 40 * 86400, now - 40 * 86400))
+
+            summary = corvee.cleanup_reports(reports_root, older_than_days=30, dry_run=False)
+            self.assertEqual(summary["removed"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertFalse(old_dir.exists())
+
+    def test_cleanup_reports_dir_tilde_expansion(self) -> None:
+        temp_name = f".tmp_test_corvee_cleanup_{uuid.uuid4().hex}"
+        home_temp = Path.home() / temp_name
+        home_temp.mkdir(parents=True, exist_ok=True)
+        try:
+            old_dir = home_temp / uuid.uuid4().hex
+            old_dir.mkdir()
+            f = old_dir / "status.json"
+            f.touch()
+            now = time.time()
+            os.utime(f, (now - 40 * 86400, now - 40 * 86400))
+            os.utime(old_dir, (now - 40 * 86400, now - 40 * 86400))
+
+            result = subprocess.run(
+                [sys.executable, str(CLI), "cleanup", "--reports-dir", f"~/{temp_name}", "--older-than-days", "30"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(old_dir.exists())
+        finally:
+            shutil.rmtree(home_temp, ignore_errors=True)
+
+    def test_cleanup_cli_supports_config_option(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reports_root = Path(directory) / "reports"
+            reports_root.mkdir()
+            config_path = Path(directory) / "config.toml"
+            config_path.write_text("model = 'mock'\n")
+            old_dir = reports_root / uuid.uuid4().hex
+            old_dir.mkdir()
+            f1 = old_dir / "events.jsonl"
+            f1.touch()
+            now = time.time()
+            os.utime(f1, (now - 40 * 86400, now - 40 * 86400))
+            os.utime(old_dir, (now - 40 * 86400, now - 40 * 86400))
+
+            res1 = subprocess.run(
+                [sys.executable, str(CLI), "cleanup", "--config", str(config_path), "--reports-dir", str(reports_root)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res1.returncode, 0)
+            self.assertFalse(old_dir.exists())
+
+            old_dir2 = reports_root / uuid.uuid4().hex
+            old_dir2.mkdir()
+            f2 = old_dir2 / "events.jsonl"
+            f2.touch()
+            os.utime(f2, (now - 40 * 86400, now - 40 * 86400))
+            os.utime(old_dir2, (now - 40 * 86400, now - 40 * 86400))
+
+            res2 = subprocess.run(
+                [sys.executable, str(CLI), "--config", str(config_path), "cleanup", "--reports-dir", str(reports_root)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res2.returncode, 0)
+            self.assertFalse(old_dir2.exists())
+
+            res3 = subprocess.run(
+                [sys.executable, str(CLI), "--timeout", "1s", "cleanup",
+                 "--reports-dir", str(reports_root)],
+                capture_output=True,
+                text=True,
+            )
+            # --timeout is treated as a shared option for cleanup in the wrapper.
+            self.assertEqual(res3.returncode, 0)
+
+            res4 = subprocess.run(
+                [sys.executable, str(CLI), "cleanup", "--timeout", "1s",
+                 "--reports-dir", str(reports_root)],
+                capture_output=True,
+                text=True,
+            )
+            # cleanup accepts timeout too, but treats it as a compatibility no-op.
+            self.assertEqual(res4.returncode, 0)
+
+    def test_cleanup_in_place_file_touch_refreshes_age(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reports_root = Path(directory)
+            now = time.time()
+
+            report_dir = reports_root / "run_touched"
+            report_dir.mkdir()
+            os.utime(report_dir, (now - 40 * 86400, now - 40 * 86400))
+
+            inside_file = report_dir / "report.md"
+            inside_file.write_text("updated", encoding="utf-8")
+            os.utime(inside_file, (now - 2 * 86400, now - 2 * 86400))
+
+            summary = corvee.cleanup_reports(reports_root, older_than_days=30, dry_run=False)
+            self.assertEqual(summary["kept"], 1)
+            self.assertEqual(summary["removed"], 0)
+            self.assertTrue(report_dir.exists())
+
+    def test_cleanup_non_directory_root_returns_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            file_root = Path(directory) / "not_a_dir.txt"
+            file_root.write_text("invalid", encoding="utf-8")
+
+            summary = corvee.cleanup_reports(file_root)
+            self.assertGreater(summary["failed"], 0)
+
+            result = subprocess.run(
+                [sys.executable, str(CLI), "cleanup", "--reports-dir", str(file_root)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

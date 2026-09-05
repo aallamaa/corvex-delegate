@@ -17,6 +17,7 @@ The word after `$corvee` is a skill instruction, not a registered slash command:
 | `models [PATTERN]` | List live model IDs |
 | `select [MODEL_ID\|auto]` | Show, save, or clear the default model |
 | `check` | Verify credentials with a tiny inference request |
+| `cleanup` | Remove stale run report directories |
 | `target GOAL` | Define outcome and acceptance gates |
 | `analyze` | Assess gaps and propose work units |
 | `refine` | Clarify the target and plan |
@@ -53,7 +54,7 @@ Allowed executables are resolved at startup; delegate commands must use the exac
 
 After each run, capture the report and exit status, inspect changes, independently rerun decisive checks, and update the ledger with evidence. Exit zero means a report was returned, not that the target passed. Timeouts and missing reports are incomplete work. Never weaken acceptance gates to obtain success.
 
-Requests default to a 600-second timeout within the total run budget. Private run artifacts preserve progress, errors, and checkpoints. On failure or incomplete wrap-up, follow the recovery guidance in [control-protocol.md](references/control-protocol.md) before retrying; do not blindly increase step limits or replay tools.
+Requests default to a 600-second timeout within the total run budget. Private run artifacts preserve progress, errors, and checkpoints. On failure or incomplete wrap-up, follow the recovery guidance in [control-protocol.md](references/control-protocol.md) before retrying; prefer `scripts/corvee run --resume <run-dir>` to continue from checkpoint instead of reissuing the same mission from scratch.
 
 ## Execution boundary
 
