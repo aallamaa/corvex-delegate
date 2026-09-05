@@ -21,19 +21,19 @@ import uuid
 from typing import Any
 
 from corvee_config import (
-    ConfigError,
-    fail,
     DEFAULT_API_KEY_ENV,
     DEFAULT_BASE_URL,
+    ConfigError,
+    TransportError,
+    build_provider_request,
     default_config_path,
+    fail,
     load_config,
     load_env_file,
     parse_duration,
+    request_json,
     resolve_api_key,
     validate_base_url,
-    TransportError,
-    build_provider_request,
-    request_json,
     atomic_write as protected_write,
 )
 
@@ -74,12 +74,6 @@ PROTECTED_WRITE_COMPONENTS = frozenset({".git"})
 PROTECTED_WRITE_PREFIXES = (
     (".codex", "corvee", "reports"),
 )
-
-
-# The runner's name for a classified transport failure. The classification
-# itself lives beside the transport, so configuration commands and the runner
-# agree on what is worth retrying.
-ProviderFailure = TransportError
 
 
 def _protect_run_state(run_dir: Path) -> None:
@@ -1183,7 +1177,7 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
                 response = client.call("POST", "/chat/completions", payload)
                 event("request_end", duration_seconds=round(time.monotonic() - request_started, 3))
                 break
-            except ProviderFailure as exc:
+            except TransportError as exc:
                 event("request_error", category=str(exc), retryable=exc.retryable)
                 if exc.retryable and not stop_reason and deadline - time.monotonic() <= reserve:
                     stop_reason = "time_reserve"

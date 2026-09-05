@@ -65,9 +65,10 @@ All notable changes to this skill are recorded here. This project follows
   had their own urllib call plus its own `try/except` ladder — four ladders
   that had drifted apart, so the runner and the configuration commands could
   disagree about whether the same failure was worth retrying. There is now a
-  single `provider_request` / `request_json` transport with one `TransportError`
-  classification; `ProviderFailure` is an alias of it, and configuration
-  commands render the same error for a human audience. Response bodies are
+  single `provider_request` / `request_json` transport, and one `TransportError`
+  raised by one classifier. The runner's `ProviderFailure` is gone rather than
+  aliased: a second name for the same type only hid where the classification
+  happened. Configuration commands render that same error for a human audience. Response bodies are
   still closed unread, since an error page can echo the Authorization header.
 
 - `install-agent` is reversible: `remove-agent` strips the managed provider

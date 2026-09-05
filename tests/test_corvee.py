@@ -690,7 +690,7 @@ class RunnerRecoveryTest(unittest.TestCase):
     def test_transient_retry_does_not_replay_completed_tool(self):
         tools = corvee.RepositoryTools(Path.cwd(), False, set())
         client = corvee.ApiClient("https://example.com", "fake")
-        with patch.object(client, "call", side_effect=[self.response(calls=[self.tool_call()]), corvee.ProviderFailure("request_timeout", True), self.response("done")]), patch.object(tools, "execute", return_value='{"ok":true,"result":"file"}') as execute, patch.object(corvee.time, "sleep"):
+        with patch.object(client, "call", side_effect=[self.response(calls=[self.tool_call()]), corvee_config.TransportError("request_timeout", True), self.response("done")]), patch.object(tools, "execute", return_value='{"ok":true,"result":"file"}') as execute, patch.object(corvee.time, "sleep"):
             self.assertEqual(corvee.run_steps(client, tools, [], "mock", None, 5, 100), 0)
         self.assertEqual(execute.call_count, 1)
 
@@ -698,16 +698,16 @@ class RunnerRecoveryTest(unittest.TestCase):
         tools = corvee.RepositoryTools(Path.cwd(), False, set())
         for retryable, expected_calls, code in [(True, 2, 75), (False, 1, 1)]:
             client = corvee.ApiClient("https://example.com", "fake")
-            with patch.object(client, "call", side_effect=corvee.ProviderFailure("failure", retryable)) as call, patch.object(corvee.time, "sleep"), self.assertRaises(SystemExit) as error:
+            with patch.object(client, "call", side_effect=corvee_config.TransportError("failure", retryable)) as call, patch.object(corvee.time, "sleep"), self.assertRaises(SystemExit) as error:
                 corvee.run_steps(client, tools, [], "mock", None, 5, 100)
             self.assertEqual(error.exception.code, code)
             self.assertEqual(call.call_count, expected_calls)
 
     def test_socket_timeout_is_classified_without_traceback(self):
-        # The transport lives in corvee_config so the runner and the
-        # configuration commands classify failures identically.
+        # The transport lives in corvee_config, so the runner and the
+        # configuration commands raise the same type from the same classifier.
         client = corvee.ApiClient("https://example.com", "fake")
-        with patch.object(corvee_config, "open_request", side_effect=TimeoutError("sensitive error")), self.assertRaises(corvee.ProviderFailure) as error:
+        with patch.object(corvee_config, "open_request", side_effect=TimeoutError("sensitive error")), self.assertRaises(corvee_config.TransportError) as error:
             client.call("POST", "/chat/completions", {})
         self.assertTrue(error.exception.retryable)
         self.assertEqual(str(error.exception), "request_timeout")
@@ -864,7 +864,7 @@ class RunnerRecoveryTest(unittest.TestCase):
             argv = ["corvee", "--no-config", "--config", str(root / "config.toml"),
                     "--mission", str(mission), "--cwd", str(root), "--model", "mock",
                     "--run-dir", str(artifacts), "--request-retries", "0"]
-            with patch.object(sys, "argv", argv), patch.dict(os.environ, {"CORVEX_API_KEY": "fake-secret"}), patch.object(corvee.ApiClient, "call", side_effect=[self.response(calls=[self.tool_call()]), corvee.ProviderFailure("request_timeout", True)]), patch.object(corvee.RepositoryTools, "execute", return_value='{"ok":true,"result":"saved evidence"}'), self.assertRaises(SystemExit) as error:
+            with patch.object(sys, "argv", argv), patch.dict(os.environ, {"CORVEX_API_KEY": "fake-secret"}), patch.object(corvee.ApiClient, "call", side_effect=[self.response(calls=[self.tool_call()]), corvee_config.TransportError("request_timeout", True)]), patch.object(corvee.RepositoryTools, "execute", return_value='{"ok":true,"result":"saved evidence"}'), self.assertRaises(SystemExit) as error:
                 corvee.main()
             self.assertEqual(error.exception.code, 75)
             self.assertEqual(json.loads((artifacts / "status.json").read_text())["exit_code"], 75)
@@ -1597,7 +1597,7 @@ class WrapUpReserveTest(unittest.TestCase):
         def call(method, endpoint, payload):
             attempts.append(payload)
             if len(attempts) == 1:
-                raise corvee.ProviderFailure("http_503", True)
+                raise corvee_config.TransportError("http_503", True)
             return self.response("partial evidence")
 
         # Step one starts inside the reserve window and fails retryably.
@@ -1616,7 +1616,7 @@ class WrapUpReserveTest(unittest.TestCase):
         client = corvee.ApiClient("https://example.com", "fake")
 
         def always_fail(method, endpoint, payload):
-            raise corvee.ProviderFailure("http_503", True)
+            raise corvee_config.TransportError("http_503", True)
 
         times = iter([0, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85])
         with patch.object(corvee.time, "monotonic", side_effect=lambda: next(times, 85)):
@@ -1751,7 +1751,7 @@ class SharedTransportTest(unittest.TestCase):
     def test_runner_and_configuration_classify_the_same_failure_alike(self) -> None:
         client = corvee.ApiClient("https://provider.example/v1", "k")
         with patch.object(corvee_config, "open_request", side_effect=self.http_error(503)):
-            with self.assertRaises(corvee.ProviderFailure) as runner_error:
+            with self.assertRaises(corvee_config.TransportError) as runner_error:
                 client.call("POST", "/chat/completions", {})
             with self.assertRaises(corvee_config.ConfigError) as config_error:
                 corvee_config.fetch_models("https://provider.example/v1", "k", 5)
@@ -1763,7 +1763,7 @@ class SharedTransportTest(unittest.TestCase):
     def test_no_caller_leaks_the_response_body(self) -> None:
         client = corvee.ApiClient("https://provider.example/v1", "k")
         with patch.object(corvee_config, "open_request", side_effect=self.http_error(401)):
-            with self.assertRaises(corvee.ProviderFailure) as runner_error:
+            with self.assertRaises(corvee_config.TransportError) as runner_error:
                 client.call("GET", "/models")
             with self.assertRaises(corvee_config.ConfigError) as config_error:
                 corvee_config.fetch_models("https://provider.example/v1", "k", 5)
