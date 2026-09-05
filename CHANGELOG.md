@@ -5,6 +5,19 @@ All notable changes to this skill are recorded here. This project follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `RunJournal.summarize` matched event names the runner never emits (`error`,
+  `tools_disabled`, `budget_warning`, `tool_error`) and misspelled `wrap_up` as
+  `wrapup`. Every outcome-changing event -- wrap-up, wrap-up rejection, stalls,
+  request errors and retries -- was therefore dropped from stderr instead of
+  summarized, which is a failure that shows up as silence. The names now live in
+  `SUMMARIZED_EVENTS`, and a test asserts every one of them is a name the runner
+  actually emits so they cannot drift apart again.
+- The cleanup tilde-expansion test built its fixture inside the developer's real
+  home directory and leaked it if interrupted. It now gives the subprocess its
+  own `HOME`.
+
 ### Removed
 
 - The experimental native-Codex-subagent path is gone: `scripts/native_agent.py`,
@@ -40,6 +53,22 @@ All notable changes to this skill are recorded here. This project follows
 
 ### Changed
 
+- `build_provider_request` no longer takes `accept` and `user_agent`: only the
+  deleted SSE probe ever passed anything but the default. `provider_request`
+  went with it -- it existed to hand a live stream to that probe, had one
+  caller, and is now folded into `request_json`.
+- `tool_list_files` and `grep_search` had the same filtered directory walk
+  copied into both; it is now `RepositoryTools.walk_visible_files`. The
+  redundant `safe_path` re-validation of a path just produced by walking the
+  root is gone -- skipping symlinks is what actually bounds that walk.
+- `main()` drops from ~245 to ~178 lines: provider settings resolution
+  (model/credential/endpoint precedence, including the dotenv redirection rule)
+  and budget resolution are now `resolve_provider_settings` and
+  `resolve_budget`, with the complexity table as a module constant.
+- Test suite: one shared `without_ripgrep()` context manager replaces five
+  hand-rolled copies, one `FakeResponse` replaces two inline `Body` doubles, a
+  `CleanupTest.aged_report` helper replaces the repeated fixture boilerplate,
+  and the mock provider's dead `/responses` SSE branch is gone.
 - `SKILL.md` separates the six CLI-backed instructions from the six planning
   steps that have no script behind them; the earlier single table presented all
   twelve as if they were commands.

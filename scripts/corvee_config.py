@@ -120,15 +120,13 @@ def build_provider_request(
     api_key: str,
     method: str = "GET",
     payload: dict[str, Any] | None = None,
-    accept: str = "application/json",
-    user_agent: str = "codex-corvee/1",
 ) -> request.Request:
     """Build an authenticated provider request against a validated base URL."""
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     headers = {
-        "Accept": accept,
+        "Accept": "application/json",
         "Authorization": f"Bearer {api_key}",
-        "User-Agent": user_agent,
+        "User-Agent": "codex-corvee/1",
     }
     if body is not None:
         headers["Content-Type"] = "application/json"
@@ -137,23 +135,20 @@ def build_provider_request(
     )
 
 
-@contextmanager
-def provider_request(req: request.Request, *, timeout: int, deadline: bool = True):
-    """Open a provider request, translating every failure into a TransportError.
+def request_json(req: request.Request, *, timeout: int, deadline: bool = True) -> Any:
+    """Perform a request and decode a JSON body, translating every failure.
 
-    Reads performed inside the block are covered too, which is what the SSE
-    probe needs: a stream that dies mid-body is a transport failure, not a
-    protocol one. `deadline` adds a SIGALRM wall-clock bound for callers that
-    are not already running inside one; the runner is, and nesting two itimers
-    around the same request buys nothing.
+    The body is read inside the guarded block: a response that dies mid-read is
+    a transport failure, not a protocol one. `deadline` adds a SIGALRM
+    wall-clock bound for callers not already inside one; the runner is, and
+    nesting two itimers around one request buys nothing.
     """
     try:
         if deadline:
             with request_deadline(timeout), open_request(req, timeout=timeout) as response:
-                yield response
-        else:
-            with open_request(req, timeout=timeout) as response:
-                yield response
+                return json.loads(response.read().decode("utf-8"))
+        with open_request(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
     except error.HTTPError as exc:
         exc.close()
         raise TransportError(f"http_{exc.code}", exc.code in RETRYABLE_STATUS, exc.code) from None
@@ -168,12 +163,6 @@ def provider_request(req: request.Request, *, timeout: int, deadline: bool = Tru
         raise TransportError("invalid_json") from None
     except (ConnectionError, OSError):
         raise TransportError("connection_error", True) from None
-
-
-def request_json(req: request.Request, *, timeout: int, deadline: bool = True) -> Any:
-    """Perform a request and decode a JSON body, or raise TransportError."""
-    with provider_request(req, timeout=timeout, deadline=deadline) as response:
-        return json.loads(response.read().decode("utf-8"))
 
 
 def describe_transport_error(subject: str, exc: TransportError) -> str:

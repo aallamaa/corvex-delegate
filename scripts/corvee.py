@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
 from corvee_config import (
@@ -55,6 +56,20 @@ GREP_BATCH_TIMEOUT = 60
 # A per-batch timeout alone bounds nothing: a large tree is many batches, and
 # one search could otherwise consume an entire run budget.
 GREP_TOTAL_TIMEOUT = 120
+
+# Events worth one stderr line: run boundaries, and anything that changes the
+# outcome. Per-step request/tool traffic stays in events.jsonl, which is the
+# whole point of not echoing the stream at the planner.
+SUMMARIZED_EVENTS = frozenset({
+    "run_start", "run_resume", "run_end",
+    "request_error", "request_retry",
+    "wrap_up", "wrap_up_rejected",
+    "stall_warning", "stall_detected",
+})
+SUMMARY_FIELDS = frozenset({
+    "status", "exit_code", "model", "max_steps", "max_time_seconds", "start_step",
+    "reason", "category", "retryable", "delay_seconds", "from_phase",
+})
 
 COMMAND_ENV_ALLOWLIST = frozenset({
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR",
@@ -197,17 +212,17 @@ class RunJournal:
 
     @staticmethod
     def summarize(event: str, fields: dict[str, Any]) -> str | None:
-        """One terse line for the events worth interrupting the planner over."""
-        if event in {"run_start", "run_resume", "run_end", "error", "request_error",
-                     "wrapup", "tools_disabled", "budget_warning"}:
-            detail = " ".join(f"{key}={value}" for key, value in fields.items()
-                              if key in {"status", "exit_code", "model", "max_steps",
-                                         "max_time_seconds", "start_step", "reason",
-                                         "message", "attempt"})
-            return f"[{event}] {detail}".rstrip()
-        if event == "tool_error":
-            return f"[tool_error] {fields.get('tool', '?')}: {fields.get('message', '')}"
-        return None
+        """One terse line for the events worth interrupting the planner over.
+
+        Every name here must be one `run_steps` or `finish` actually emits;
+        SUMMARIZED_EVENTS is asserted against the emitted set by the tests,
+        because a name that drifts fails silently and invisibly.
+        """
+        if event not in SUMMARIZED_EVENTS:
+            return None
+        detail = " ".join(f"{key}={value}" for key, value in fields.items()
+                          if key in SUMMARY_FIELDS)
+        return f"[{event}] {detail}".rstrip()
 
     def checkpoint(self, messages, phase: str):
         self.messages = messages
@@ -221,9 +236,8 @@ class RunJournal:
         }
         if self.run_context is not None:
             checkpoint_data["run_context"] = self.run_context
-        protected_write(self.directory / "checkpoint.json", self.redact(json.dumps({
-            **checkpoint_data
-        }, ensure_ascii=False)))
+        protected_write(self.directory / "checkpoint.json",
+                        self.redact(json.dumps(checkpoint_data, ensure_ascii=False)))
 
     def finish(self, status: str, code: int):
         self.checkpoint(self.messages, self.phase)
@@ -240,9 +254,8 @@ class RunJournal:
             "usage": self.usage, "economics": self.economics,
         }))
         self.event("run_end", status=status, exit_code=code)
-        report = self.directory / "report.md"
-        if not report.exists():
-            protected_write(report, f"# Incomplete run\n\nStatus: {status}; exit code: {code}.\n"
+        if not report_path.exists():
+            protected_write(report_path, f"# Incomplete run\n\nStatus: {status}; exit code: {code}.\n"
                             f"Last step: {self.step}; phase: {self.phase}.\n"
                             "No final model report was received. Inspect checkpoint.json and events.jsonl. "
                             "Do not replay pending tools without checking repository state.\n")
@@ -404,8 +417,7 @@ def _force_remove_tree(path: Path, depth: int = 0) -> None:
     os.rmdir(path)
 
 
-def _remove_readonly_onexc(func: Any, path: Any, exc: Any) -> None:
-    del func, exc
+def _remove_readonly_onexc(_func: Any, path: Any, _exc: Any) -> None:
     _force_remove_tree(Path(path))
 
 
@@ -753,10 +765,21 @@ class RepositoryTools:
             if result.returncode not in (0, 1):
                 raise ValueError(result.stderr.strip() or "rg --files failed")
             return self.capped_listing(result.stdout.splitlines())
-        # Walk explicitly rather than rglob: a bare rglob descends into .git,
-        # whose loose objects exhaust MAX_LIST_ENTRIES before any source file
-        # is reached, and follows symlinks out of the repository.
         matches: list[str] = []
+        for relative in self.walk_visible_files(glob):
+            matches.append(relative)
+            if len(matches) > MAX_LIST_ENTRIES:
+                break
+        return self.capped_listing(matches)
+
+    def walk_visible_files(self, glob: str) -> Iterator[str]:
+        """Yield repository-relative paths matching `glob`, in a stable order.
+
+        The fallback for both listing and search. A plain rglob would descend
+        into .git -- whose loose objects exhaust any cap before a source file is
+        reached -- and would follow symlinks out of the repository, so hidden
+        entries and links are skipped here rather than at each call site.
+        """
         for directory, dirs, files in os.walk(self.root, followlinks=False):
             dirs[:] = sorted(name for name in dirs if not name.startswith("."))
             for name in sorted(files):
@@ -765,10 +788,7 @@ class RepositoryTools:
                     continue
                 relative = str(candidate.relative_to(self.root))
                 if fnmatch.fnmatch(relative, glob) or fnmatch.fnmatch(name, glob):
-                    matches.append(relative)
-                    if len(matches) > MAX_LIST_ENTRIES:
-                        return self.capped_listing(matches)
-        return self.capped_listing(matches)
+                    yield relative
 
     @staticmethod
     def capped_listing(entries: list[str]) -> str:
@@ -821,25 +841,16 @@ class RepositoryTools:
             size += len(result.stdout)
             return size <= MAX_TOOL_OUTPUT
 
-        # Explicit files avoid recursive grep following symlinks outside the root.
-        for directory, dirs, files in os.walk(self.root, followlinks=False):
-            dirs[:] = sorted(name for name in dirs if not name.startswith("."))
-            for name in sorted(files):
-                candidate = Path(directory) / name
-                relative = str(candidate.relative_to(self.root))
-                if name.startswith(".") or candidate.is_symlink() or not candidate.is_file():
-                    continue
-                if not (fnmatch.fnmatch(relative, glob) or fnmatch.fnmatch(name, glob)):
-                    continue
-                # Validate, but hand grep the relative path: absolute paths would
-                # echo the user's home directory back to the provider, and ripgrep
-                # already reports relative.
-                self.safe_path(relative)
-                batch.append(os.path.join(".", relative))
-                if len(batch) >= GREP_BATCH_SIZE:
-                    if not flush(batch):
-                        return self.searched(output, exhausted)
-                    batch = []
+        # Naming files explicitly stops recursive grep from following symlinks
+        # out of the root. Paths stay relative: an absolute one would echo the
+        # user's home directory back to the provider, and ripgrep reports
+        # relative paths anyway.
+        for relative in self.walk_visible_files(glob):
+            batch.append(os.path.join(".", relative))
+            if len(batch) >= GREP_BATCH_SIZE:
+                if not flush(batch):
+                    return self.searched(output, exhausted)
+                batch = []
         flush(batch)
         return self.searched(output, exhausted)
 
@@ -987,21 +998,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
-    config_path = args.config.expanduser().resolve()
-    try:
-        config = {} if args.no_config else load_config(config_path)
-    except ConfigError as exc:
-        fail(str(exc))
-    env_file_values: dict[str, str] = {}
-    if args.env_file:
-        try:
-            env_path = args.env_file.resolve(strict=True)
-            env_file_values = load_env_file(env_path)
-        except (OSError, ConfigError) as exc:
-            fail(f"cannot read --env-file {args.env_file}: {exc}")
+COMPLEXITY_BUDGETS = {
+    "low": (16, 20 * 60),
+    "medium": (32, 60 * 60),
+    "high": (48, 120 * 60),
+}
 
+
+def resolve_provider_settings(args, config, config_path, env_file_values):
+    """Resolve model, credential and endpoint from flags, env, dotenv and config.
+
+    Precedence differs per field and the credential rule is security-relevant,
+    so this is one function rather than three: the endpoint may only come from
+    a dotenv that also supplied the key.
+    """
     model_config_value = ""
     if args.model_config:
         try:
@@ -1056,16 +1066,45 @@ def main() -> int:
         or config.get("base_url")
         or DEFAULT_BASE_URL
     )
-
     if not api_key:
         fail(
             "Corvex API credential is not configured. Run "
             "scripts/corvee configure or set CORVEX_API_KEY."
         )
-    client = ApiClient(base_url, api_key, timeout=args.http_timeout)
-
     if not model:
         fail("Select a Corvex model with $corvee select or pass --model")
+    return base_url, api_key, model, api_key_env
+
+
+def resolve_budget(args, config):
+    """Map --complexity plus any explicit override onto (max_steps, max_time)."""
+    complexity = args.complexity or config.get("default_complexity") or "medium"
+    if complexity not in COMPLEXITY_BUDGETS:
+        fail(f"invalid configured default_complexity: {complexity}")
+    default_steps, default_time = COMPLEXITY_BUDGETS[complexity]
+    return args.max_steps or default_steps, args.max_time or default_time
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    config_path = args.config.expanduser().resolve()
+    try:
+        config = {} if args.no_config else load_config(config_path)
+    except ConfigError as exc:
+        fail(str(exc))
+    env_file_values: dict[str, str] = {}
+    if args.env_file:
+        try:
+            env_path = args.env_file.resolve(strict=True)
+            env_file_values = load_env_file(env_path)
+        except (OSError, ConfigError) as exc:
+            fail(f"cannot read --env-file {args.env_file}: {exc}")
+
+    base_url, api_key, model, api_key_env = resolve_provider_settings(
+        args, config, config_path, env_file_values
+    )
+    client = ApiClient(base_url, api_key, timeout=args.http_timeout)
+
     if args.mission is None and not args.resume:
         fail("--mission is required unless --resume is used")
     if args.max_steps is not None and args.max_steps < 1:
@@ -1075,17 +1114,7 @@ def main() -> int:
     if not 0 <= args.request_retries <= 2:
         fail("--request-retries must be between 0 and 2")
 
-    complexity = args.complexity or config.get("default_complexity") or "medium"
-    if complexity not in {"low", "medium", "high"}:
-        fail(f"invalid configured default_complexity: {complexity}")
-    defaults = {
-        "low": (16, 20 * 60),
-        "medium": (32, 60 * 60),
-        "high": (48, 120 * 60),
-    }
-    default_steps, default_time = defaults[complexity]
-    max_steps = args.max_steps or default_steps
-    max_time = args.max_time or default_time
+    max_steps, max_time = resolve_budget(args, config)
 
     try:
         root = args.cwd.resolve(strict=True)

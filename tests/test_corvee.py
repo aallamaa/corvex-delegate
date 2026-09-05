@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,6 +31,33 @@ SCRIPT = SKILL_ROOT / "scripts" / "corvee.py"
 CONFIGURE = SKILL_ROOT / "scripts" / "configure_corvee.py"
 INSTALL = SKILL_ROOT / "scripts" / "install.py"
 CLI = SKILL_ROOT / "scripts" / "corvee"
+
+
+class FakeResponse:
+    """A minimal urlopen result: a context manager with a read()."""
+
+    headers = None
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def read(self) -> bytes:
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+@contextmanager
+def without_ripgrep():
+    """Force the grep/walk fallbacks, which several suites need to exercise."""
+    real_which = shutil.which
+    with patch.object(corvee.shutil, "which",
+                      lambda name: None if name == "rg" else real_which(name)):
+        yield
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -64,29 +92,6 @@ class MockHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"choices": [{"message": {"content": "OK"}}]}).encode())
-            return
-        if self.path.endswith("/responses"):
-            function_call = {
-                "type": "function_call",
-                "id": "fc-1",
-                "call_id": "call-1",
-                "name": "compatibility_probe",
-                "arguments": '{"value":"ok"}',
-                "status": "completed",
-            }
-            events = [
-                {"type": "response.created", "response": {"id": "resp-1", "output": []}},
-                {"type": "response.output_item.done", "item": function_call},
-                {
-                    "type": "response.completed",
-                    "response": {"id": "resp-1", "status": "completed", "output": [function_call]},
-                },
-            ]
-            body = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            self.wfile.write(body.encode())
             return
         MockHandler.tools_seen = [tool["function"]["name"] for tool in payload["tools"]]
         MockHandler.calls += 1
@@ -840,8 +845,7 @@ class AuditRegressionTest(unittest.TestCase):
             self.assertIn("sample.txt:1:--pre=/usr/bin/printenv", result)
 
     def test_grep_fallback_filters_files_and_skips_symlinks(self):
-        real_which = shutil.which
-        if not real_which("grep"):
+        if not shutil.which("grep"):
             self.skipTest("grep unavailable")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
@@ -852,7 +856,7 @@ class AuditRegressionTest(unittest.TestCase):
             outside.write_text("outside-secret\n")
             (root / "linked.txt").symlink_to(outside)
             tools = corvee.RepositoryTools(root, False, set())
-            with patch.object(corvee.shutil, "which", side_effect=lambda name: None if name == "rg" else real_which(name)):
+            with without_ripgrep():
                 result = tools.tool_search_text("alpha[0-9]+", "*.txt")
                 self.assertIn("sample.txt:2:alpha42", result)
                 self.assertNotIn("skip.py", result)
@@ -923,23 +927,25 @@ class AuditRegressionTest(unittest.TestCase):
 
 
 class CleanupTest(unittest.TestCase):
+    @staticmethod
+    def aged_report(root: Path, *, days: float, name: str | None = None,
+                    artifacts: tuple[str, ...] = ("report.md",)) -> Path:
+        """Create one report directory whose contents and mtime are `days` old."""
+        directory = root / (name or uuid.uuid4().hex)
+        directory.mkdir()
+        stamp = time.time() - days * 86400
+        for artifact in artifacts:
+            path = directory / artifact
+            path.touch()
+            os.utime(path, (stamp, stamp))
+        os.utime(directory, (stamp, stamp))
+        return directory
+
     def test_cleanup_older_than_days_and_dry_run_behavior(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             reports_root = Path(directory)
-            now = time.time()
-            old_dir = reports_root / uuid.uuid4().hex
-            old_dir.mkdir()
-            f1 = old_dir / "report.md"
-            f1.touch()
-            os.utime(f1, (now - 40 * 86400, now - 40 * 86400))
-            os.utime(old_dir, (now - 40 * 86400, now - 40 * 86400))
-
-            new_dir = reports_root / uuid.uuid4().hex
-            new_dir.mkdir()
-            f2 = new_dir / "report.md"
-            f2.touch()
-            os.utime(f2, (now - 5 * 86400, now - 5 * 86400))
-            os.utime(new_dir, (now - 5 * 86400, now - 5 * 86400))
+            old_dir = self.aged_report(reports_root, days=40)
+            new_dir = self.aged_report(reports_root, days=5)
 
             dry_run_summary = corvee.cleanup_reports(reports_root, older_than_days=30, dry_run=True)
             self.assertEqual(dry_run_summary["removed"], 1)
@@ -1059,8 +1065,12 @@ class CleanupTest(unittest.TestCase):
             self.assertFalse(old_dir.exists())
 
     def test_cleanup_reports_dir_tilde_expansion(self) -> None:
+        # Give the subprocess its own HOME: the old version created the fixture
+        # in the developer's real home directory and leaked it on interruption.
+        fake_home = tempfile.TemporaryDirectory()
+        self.addCleanup(fake_home.cleanup)
         temp_name = f".tmp_test_corvee_cleanup_{uuid.uuid4().hex}"
-        home_temp = Path.home() / temp_name
+        home_temp = Path(fake_home.name) / temp_name
         home_temp.mkdir(parents=True, exist_ok=True)
         try:
             old_dir = home_temp / uuid.uuid4().hex
@@ -1075,6 +1085,7 @@ class CleanupTest(unittest.TestCase):
                 [sys.executable, str(CLI), "cleanup", "--reports-dir", f"~/{temp_name}", "--older-than-days", "30"],
                 capture_output=True,
                 text=True,
+                env={**os.environ, "HOME": fake_home.name},
             )
             self.assertEqual(result.returncode, 0)
             self.assertFalse(old_dir.exists())
@@ -1271,9 +1282,7 @@ class GrepFallbackTest(unittest.TestCase):
                 (root / f"file{index}.txt").write_text(f"needle {index}\n", encoding="utf-8")
             (root / ".hidden.txt").write_text("needle hidden\n", encoding="utf-8")
             tools = corvee.RepositoryTools(root, False, set())
-            real_which = shutil.which
-            with patch.object(corvee.shutil, "which",
-                              lambda name: None if name == "rg" else real_which(name)):
+            with without_ripgrep():
                 with patch.object(corvee, "GREP_BATCH_SIZE", 5):
                     calls: list[list[str]] = []
                     real_run = corvee.run_process
@@ -1299,9 +1308,7 @@ class GrepFallbackTest(unittest.TestCase):
             (root / "escape.txt").symlink_to(secret)
             (root / "real.txt").write_text("needle inside\n", encoding="utf-8")
             tools = corvee.RepositoryTools(root, False, set())
-            real_which = shutil.which
-            with patch.object(corvee.shutil, "which",
-                              lambda name: None if name == "rg" else real_which(name)):
+            with without_ripgrep():
                 result = json.loads(tools.execute("search_text", {"pattern": "needle"}))
             self.assertTrue(result["ok"], result)
             self.assertIn("real.txt", result["result"])
@@ -1355,13 +1362,6 @@ class ResumeAuthorityTest(unittest.TestCase):
 class FallbackListingTest(unittest.TestCase):
     """Without ripgrep, list_files must not spend the cap inside .git."""
 
-    @contextmanager
-    def without_ripgrep(self):
-        real_which = shutil.which
-        with patch.object(corvee.shutil, "which",
-                          lambda name: None if name == "rg" else real_which(name)):
-            yield
-
     def test_listing_skips_hidden_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -1372,7 +1372,7 @@ class FallbackListingTest(unittest.TestCase):
             (root / "src").mkdir()
             (root / "src" / "main.py").write_text("print(1)\n", encoding="utf-8")
             tools = corvee.RepositoryTools(root, False, set())
-            with self.without_ripgrep():
+            with without_ripgrep():
                 result = json.loads(tools.execute("list_files", {}))
             self.assertTrue(result["ok"], result)
             self.assertIn("src/main.py", result["result"])
@@ -1386,7 +1386,7 @@ class FallbackListingTest(unittest.TestCase):
             (root / "escape.txt").symlink_to(secret)
             (root / "real.txt").write_text("public\n", encoding="utf-8")
             tools = corvee.RepositoryTools(root, False, set())
-            with self.without_ripgrep():
+            with without_ripgrep():
                 result = json.loads(tools.execute("list_files", {}))
             self.assertIn("real.txt", result["result"])
             self.assertNotIn("escape.txt", result["result"])
@@ -1422,6 +1422,27 @@ class QuietJournalTest(unittest.TestCase):
         self.assertIn("run_end", line)
         self.assertIn("exit_code=0", line)
 
+    def test_every_summarized_name_is_an_event_the_runner_emits(self) -> None:
+        # A summarized name that drifts from the emitted name fails silently:
+        # the line simply never appears. Pin them to the source.
+        source = (SKILL_ROOT / "scripts" / "corvee.py").read_text(encoding="utf-8")
+        emitted = set(re.findall(r'event\("([a-z_]+)"', source))
+        self.assertTrue(emitted, "no events found in the runner source")
+        self.assertLessEqual(corvee.SUMMARIZED_EVENTS, emitted,
+                             "summarized events that nothing emits: "
+                             f"{sorted(corvee.SUMMARIZED_EVENTS - emitted)}")
+
+    def test_wrap_up_and_stall_reach_stderr(self) -> None:
+        # These are outcome-changing and were dropped by an earlier typo.
+        journal = corvee.RunJournal(self.run_dir, "")
+        stream = io.StringIO()
+        with redirect_stderr(stream):
+            journal.event("wrap_up", reason="time_reserve")
+            journal.event("stall_detected")
+        output = stream.getvalue()
+        self.assertIn("[wrap_up] reason=time_reserve", output)
+        self.assertIn("[stall_detected]", output)
+
     def test_verbose_restores_the_full_event_stream(self) -> None:
         journal = corvee.RunJournal(self.run_dir, "")
         journal.verbose = True
@@ -1434,7 +1455,7 @@ class QuietJournalTest(unittest.TestCase):
         journal = corvee.RunJournal(self.run_dir, "sk-secret-value")
         stream = io.StringIO()
         with redirect_stderr(stream):
-            journal.event("error", message="rejected sk-secret-value")
+            journal.event("request_error", category="rejected sk-secret-value", retryable=False)
         self.assertNotIn("sk-secret-value", stream.getvalue())
         self.assertIn("[REDACTED]", stream.getvalue())
 
@@ -1576,9 +1597,7 @@ class AdversarialHardeningTest(unittest.TestCase):
     def test_grep_fallback_reports_relative_paths(self) -> None:
         (self.root / "src" / "hit.txt").write_text("needle\n", encoding="utf-8")
         tools = corvee.RepositoryTools(self.root, False, set())
-        real_which = shutil.which
-        with patch.object(corvee.shutil, "which",
-                          lambda name: None if name == "rg" else real_which(name)):
+        with without_ripgrep():
             result = json.loads(tools.execute("search_text", {"pattern": "needle"}))
         self.assertTrue(result["ok"], result)
         self.assertIn("src/hit.txt", result["result"])
@@ -1783,19 +1802,8 @@ class SharedTransportTest(unittest.TestCase):
             self.assertNotIn("sk-live-REALKEY", str(surfaced.exception))
 
     def test_invalid_json_is_not_retryable(self) -> None:
-        class Body:
-            headers = None
-
-            def read(self):
-                return b"<html>not json</html>"
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        with patch.object(corvee_config, "open_request", return_value=Body()):
+        with patch.object(corvee_config, "open_request",
+                          return_value=FakeResponse(b"<html>not json</html>")):
             with self.assertRaises(corvee_config.TransportError) as error:
                 corvee_config.request_json(
                     corvee_config.build_provider_request(
@@ -1811,16 +1819,6 @@ class SharedTransportTest(unittest.TestCase):
         # fight it. Configuration commands, which hold none, must arm one.
         seen = []
 
-        class Body:
-            def read(self):
-                return b'{"data":[]}'
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
         original = corvee_config.request_deadline
 
         @contextmanager
@@ -1829,7 +1827,7 @@ class SharedTransportTest(unittest.TestCase):
             with original(seconds):
                 yield
 
-        with patch.object(corvee_config, "open_request", return_value=Body()):
+        with patch.object(corvee_config, "open_request", return_value=FakeResponse(b'{"data":[]}')):
             with patch.object(corvee_config, "request_deadline", spy):
                 corvee.ApiClient("https://provider.example/v1", "k", timeout=7).call("GET", "/models")
                 self.assertEqual(seen, [])
@@ -1931,9 +1929,7 @@ class ListingCapTest(unittest.TestCase):
                 (root / f"f{index}.txt").write_text("x", encoding="utf-8")
             tools = corvee.RepositoryTools(root, False, set())
             with_rg = json.loads(tools.execute("list_files", {}))
-            real_which = shutil.which
-            with patch.object(corvee.shutil, "which",
-                              lambda name: None if name == "rg" else real_which(name)):
+            with without_ripgrep():
                 without_rg = json.loads(tools.execute("list_files", {}))
         for listing in (with_rg, without_rg):
             self.assertTrue(listing["ok"], listing)
