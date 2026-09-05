@@ -19,7 +19,6 @@ import tempfile
 import time
 import uuid
 from typing import Any
-from urllib import error, request
 
 from corvee_config import (
     ConfigError,
@@ -32,7 +31,9 @@ from corvee_config import (
     parse_duration,
     resolve_api_key,
     validate_base_url,
-    open_request,
+    TransportError,
+    build_provider_request,
+    request_json,
     atomic_write as protected_write,
 )
 
@@ -75,10 +76,10 @@ PROTECTED_WRITE_PREFIXES = (
 )
 
 
-class ProviderFailure(Exception):
-    def __init__(self, category: str, retryable: bool = False):
-        super().__init__(category)
-        self.retryable = retryable
+# The runner's name for a classified transport failure. The classification
+# itself lives beside the transport, so configuration commands and the runner
+# agree on what is worth retrying.
+ProviderFailure = TransportError
 
 
 def _protect_run_state(run_dir: Path) -> None:
@@ -463,32 +464,12 @@ class ApiClient:
         self.timeout = timeout
 
     def call(self, method: str, endpoint: str, payload: dict[str, Any] | None = None) -> Any:
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": "codex-corvee/1",
-        }
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-        req = request.Request(
-            f"{self.base_url}{endpoint}", data=body, headers=headers, method=method
+        req = build_provider_request(
+            self.base_url, endpoint, api_key=self.api_key, method=method, payload=payload
         )
-        try:
-            with open_request(req, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except error.HTTPError as exc:
-            exc.close()
-            raise ProviderFailure(f"http_{exc.code}", exc.code in {408, 429, 500, 502, 503, 504}) from None
-        except TimeoutError:
-            raise ProviderFailure("request_timeout", True) from None
-        except error.URLError as exc:
-            raise ProviderFailure("request_timeout" if isinstance(exc.reason, TimeoutError)
-                                  else "connection_error", True) from None
-        except (ConnectionError, OSError):
-            raise ProviderFailure("connection_error", True) from None
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            raise ProviderFailure("invalid_json") from None
+        # No SIGALRM here: run_steps already holds the run-budget itimer, and a
+        # nested one would only fight it. The socket timeout still applies.
+        return request_json(req, timeout=self.timeout, deadline=False)
 
 
 class RepositoryTools:

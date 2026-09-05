@@ -93,6 +93,100 @@ def open_request(req: request.Request, timeout: int):
     return request.build_opener(NoRedirect()).open(req, timeout=timeout)
 
 
+# Statuses worth a second attempt; everything else is a client-side problem
+# that a retry would only repeat, at the cost of a duplicate inference charge.
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+class TransportError(Exception):
+    """One classification of a failed provider request, shared by all callers.
+
+    Carries a stable category string and a retry verdict. It never carries a
+    response body: an error page from a misconfigured endpoint can echo the
+    Authorization header back, so bodies are closed unread.
+    """
+
+    def __init__(self, category: str, retryable: bool = False, status: int | None = None) -> None:
+        super().__init__(category)
+        self.category = category
+        self.retryable = retryable
+        self.status = status
+
+
+def build_provider_request(
+    base_url: str,
+    endpoint: str,
+    *,
+    api_key: str,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    accept: str = "application/json",
+    user_agent: str = "codex-corvee/1",
+) -> request.Request:
+    """Build an authenticated provider request against a validated base URL."""
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {
+        "Accept": accept,
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": user_agent,
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    return request.Request(
+        f"{validate_base_url(base_url)}{endpoint}", data=body, headers=headers, method=method
+    )
+
+
+@contextmanager
+def provider_request(req: request.Request, *, timeout: int, deadline: bool = True):
+    """Open a provider request, translating every failure into a TransportError.
+
+    Reads performed inside the block are covered too, which is what the SSE
+    probe needs: a stream that dies mid-body is a transport failure, not a
+    protocol one. `deadline` adds a SIGALRM wall-clock bound for callers that
+    are not already running inside one; the runner is, and nesting two itimers
+    around the same request buys nothing.
+    """
+    try:
+        if deadline:
+            with request_deadline(timeout), open_request(req, timeout=timeout) as response:
+                yield response
+        else:
+            with open_request(req, timeout=timeout) as response:
+                yield response
+    except error.HTTPError as exc:
+        exc.close()
+        raise TransportError(f"http_{exc.code}", exc.code in RETRYABLE_STATUS, exc.code) from None
+    except TimeoutError:
+        raise TransportError("request_timeout", True) from None
+    except error.URLError as exc:
+        retryable_category = (
+            "request_timeout" if isinstance(exc.reason, TimeoutError) else "connection_error"
+        )
+        raise TransportError(retryable_category, True) from None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise TransportError("invalid_json") from None
+    except (ConnectionError, OSError):
+        raise TransportError("connection_error", True) from None
+
+
+def request_json(req: request.Request, *, timeout: int, deadline: bool = True) -> Any:
+    """Perform a request and decode a JSON body, or raise TransportError."""
+    with provider_request(req, timeout=timeout, deadline=deadline) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def describe_transport_error(subject: str, exc: TransportError) -> str:
+    """Render a TransportError for a configuration-time audience."""
+    if exc.status is not None:
+        return f"{subject} returned HTTP {exc.status}"
+    if exc.category == "invalid_json":
+        return f"{subject} returned invalid JSON"
+    if exc.category == "request_timeout":
+        return f"{subject} request timed out"
+    return f"{subject} request failed; check connectivity and provider settings"
+
+
 def get_codex_home(override: Path | None = None) -> Path:
     if override is not None:
         return override.expanduser().resolve()
@@ -195,27 +289,11 @@ def resolve_api_key(
 
 
 def fetch_models(base_url: str, api_key: str, timeout: int = 600) -> list[str]:
-    req = request.Request(
-        f"{validate_base_url(base_url)}/models",
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "codex-corvee/1",
-        },
-        method="GET",
-    )
+    req = build_provider_request(base_url, "/models", api_key=api_key)
     try:
-        with request_deadline(timeout), open_request(req, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        exc.close()
-        raise ConfigError(f"Corvex API returned HTTP {exc.code}") from None
-    except error.URLError as exc:
-        raise ConfigError(f"Corvex API request failed: {exc.reason}") from exc
-    except OSError:
-        raise ConfigError("Corvex API request timed out or failed") from None
-    except json.JSONDecodeError as exc:
-        raise ConfigError("Corvex API returned invalid JSON from /models") from exc
+        payload = request_json(req, timeout=timeout)
+    except TransportError as exc:
+        raise ConfigError(describe_transport_error("Corvex API", exc)) from None
     models = payload.get("data", []) if isinstance(payload, dict) else []
     ids = sorted(
         item.get("id", "") for item in models if isinstance(item, dict) and item.get("id")
@@ -229,21 +307,15 @@ def verify_credential(base_url: str, api_key: str, model: str, timeout: int = 60
     """Model discovery is public; authenticate with a tiny inference request."""
     payload = {"model": model, "messages": [{"role": "user", "content": "Reply OK."}],
                "max_tokens": 1, "stream": False}
-    req = request.Request(
-        f"{validate_base_url(base_url)}/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST",
+    req = build_provider_request(
+        base_url, "/chat/completions", api_key=api_key, method="POST", payload=payload
     )
     try:
-        with request_deadline(timeout), open_request(req, timeout=timeout) as response:
-            result = json.loads(response.read().decode())
-    except error.HTTPError as exc:
-        # Do not expose a remote response that may echo credentials.
-        exc.close()
-        raise ConfigError(f"Credential/inference check failed: HTTP {exc.code}") from None
-    except (error.URLError, OSError, ValueError) as exc:
-        raise ConfigError("Credential/inference check failed; check connectivity and provider settings") from exc
+        result = request_json(req, timeout=timeout)
+    except TransportError as exc:
+        raise ConfigError(
+            f"Credential/inference check failed: {describe_transport_error('the provider', exc)}"
+        ) from None
     if not isinstance(result, dict) or not result.get("choices") or result.get("error"):
         raise ConfigError("Credential/inference check returned no completion choices")
 
@@ -277,16 +349,9 @@ def probe_responses_api(base_url: str, api_key: str, model: str, timeout: int = 
         "tool_choice": "required",
         "parallel_tool_calls": False,
     }
-    req = request.Request(
-        f"{validate_base_url(base_url)}/responses",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Accept": "text/event-stream",
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "codex-corvee-native-probe/1",
-        },
-        method="POST",
+    req = build_provider_request(
+        base_url, "/responses", api_key=api_key, method="POST", payload=payload,
+        accept="text/event-stream", user_agent="codex-corvee-native-probe/1",
     )
     completed = False
     function_call = False
@@ -303,7 +368,7 @@ def probe_responses_api(base_url: str, api_key: str, model: str, timeout: int = 
             return False
         return isinstance(parsed_arguments, dict) and parsed_arguments.get("value") == "ok"
     try:
-        with request_deadline(timeout), open_request(req, timeout=timeout) as response:
+        with provider_request(req, timeout=timeout) as response:
             if response.headers.get_content_type() != "text/event-stream":
                 raise ConfigError("Corvex Responses probe did not return an SSE stream")
             for raw_line in response:
@@ -331,13 +396,8 @@ def probe_responses_api(base_url: str, api_key: str, model: str, timeout: int = 
                     )
                     if function_call:
                         break
-    except error.HTTPError as exc:
-        exc.close()
-        raise ConfigError(f"Corvex Responses API returned HTTP {exc.code}") from None
-    except error.URLError as exc:
-        raise ConfigError(f"Corvex Responses API request failed: {exc.reason}") from exc
-    except OSError:
-        raise ConfigError("Corvex Responses API request timed out or failed") from None
+    except TransportError as exc:
+        raise ConfigError(describe_transport_error("Corvex Responses API", exc)) from None
     if not completed or not function_call:
         raise ConfigError("Corvex Responses API did not complete an SSE function call")
 

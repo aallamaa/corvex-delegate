@@ -22,7 +22,7 @@ import corvee_config
 import install as skill_install
 import configure_corvee
 import io
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 
 
 SKILL_ROOT = Path(__file__).parents[1]
@@ -704,11 +704,14 @@ class RunnerRecoveryTest(unittest.TestCase):
             self.assertEqual(call.call_count, expected_calls)
 
     def test_socket_timeout_is_classified_without_traceback(self):
+        # The transport lives in corvee_config so the runner and the
+        # configuration commands classify failures identically.
         client = corvee.ApiClient("https://example.com", "fake")
-        with patch.object(corvee, "open_request", side_effect=TimeoutError("sensitive error")), self.assertRaises(corvee.ProviderFailure) as error:
+        with patch.object(corvee_config, "open_request", side_effect=TimeoutError("sensitive error")), self.assertRaises(corvee.ProviderFailure) as error:
             client.call("POST", "/chat/completions", {})
         self.assertTrue(error.exception.retryable)
         self.assertEqual(str(error.exception), "request_timeout")
+        self.assertNotIn("sensitive error", str(error.exception))
 
     def test_repeated_results_trigger_wrapup(self):
         tools = corvee.RepositoryTools(Path.cwd(), False, set())
@@ -1705,6 +1708,124 @@ class NativeAgentRemovalTest(unittest.TestCase):
         self.assertIn("corvex", self.config.read_text(encoding="utf-8"))
         native_agent.remove_native_agent(self.config, self.agent)
         self.assertEqual(self.config.read_text(encoding="utf-8").strip(), 'model = "gpt-5"')
+
+
+class SharedTransportTest(unittest.TestCase):
+    """The runner and the configuration commands must classify provider
+    failures identically, and neither may surface a response body."""
+
+    @staticmethod
+    def http_error(code):
+        return corvee_config.error.HTTPError(
+            "https://provider.example/v1/models", code, "boom", {},
+            io.BytesIO(b'{"error":"Bearer sk-live-REALKEY is invalid"}'),
+        )
+
+    def test_retryable_statuses_agree_across_callers(self) -> None:
+        for code in (408, 429, 500, 502, 503, 504):
+            with self.subTest(code=code):
+                with patch.object(corvee_config, "open_request", side_effect=self.http_error(code)):
+                    with self.assertRaises(corvee_config.TransportError) as error:
+                        corvee_config.request_json(
+                            corvee_config.build_provider_request(
+                                "https://provider.example/v1", "/models", api_key="k"
+                            ),
+                            timeout=5,
+                        )
+                self.assertTrue(error.exception.retryable)
+                self.assertEqual(error.exception.status, code)
+
+    def test_client_errors_are_not_retried(self) -> None:
+        for code in (400, 401, 403, 404, 422):
+            with self.subTest(code=code):
+                with patch.object(corvee_config, "open_request", side_effect=self.http_error(code)):
+                    with self.assertRaises(corvee_config.TransportError) as error:
+                        corvee_config.request_json(
+                            corvee_config.build_provider_request(
+                                "https://provider.example/v1", "/models", api_key="k"
+                            ),
+                            timeout=5,
+                        )
+                self.assertFalse(error.exception.retryable)
+
+    def test_runner_and_configuration_classify_the_same_failure_alike(self) -> None:
+        client = corvee.ApiClient("https://provider.example/v1", "k")
+        with patch.object(corvee_config, "open_request", side_effect=self.http_error(503)):
+            with self.assertRaises(corvee.ProviderFailure) as runner_error:
+                client.call("POST", "/chat/completions", {})
+            with self.assertRaises(corvee_config.ConfigError) as config_error:
+                corvee_config.fetch_models("https://provider.example/v1", "k", 5)
+        self.assertEqual(runner_error.exception.category, "http_503")
+        self.assertTrue(runner_error.exception.retryable)
+        # Same underlying failure, audience-appropriate rendering.
+        self.assertIn("HTTP 503", str(config_error.exception))
+
+    def test_no_caller_leaks_the_response_body(self) -> None:
+        client = corvee.ApiClient("https://provider.example/v1", "k")
+        with patch.object(corvee_config, "open_request", side_effect=self.http_error(401)):
+            with self.assertRaises(corvee.ProviderFailure) as runner_error:
+                client.call("GET", "/models")
+            with self.assertRaises(corvee_config.ConfigError) as config_error:
+                corvee_config.fetch_models("https://provider.example/v1", "k", 5)
+            with self.assertRaises(corvee_config.ConfigError) as verify_error:
+                corvee_config.verify_credential("https://provider.example/v1", "k", "m", 5)
+        for surfaced in (runner_error, config_error, verify_error):
+            self.assertNotIn("sk-live-REALKEY", str(surfaced.exception))
+
+    def test_invalid_json_is_not_retryable(self) -> None:
+        class Body:
+            headers = None
+
+            def read(self):
+                return b"<html>not json</html>"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with patch.object(corvee_config, "open_request", return_value=Body()):
+            with self.assertRaises(corvee_config.TransportError) as error:
+                corvee_config.request_json(
+                    corvee_config.build_provider_request(
+                        "https://provider.example/v1", "/models", api_key="k"
+                    ),
+                    timeout=5,
+                )
+        self.assertEqual(error.exception.category, "invalid_json")
+        self.assertFalse(error.exception.retryable)
+
+    def test_runner_requests_do_not_arm_a_nested_deadline(self) -> None:
+        # run_steps already holds the run-budget itimer; a second one would
+        # fight it. Configuration commands, which hold none, must arm one.
+        seen = []
+
+        class Body:
+            def read(self):
+                return b'{"data":[]}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        original = corvee_config.request_deadline
+
+        @contextmanager
+        def spy(seconds):
+            seen.append(seconds)
+            with original(seconds):
+                yield
+
+        with patch.object(corvee_config, "open_request", return_value=Body()):
+            with patch.object(corvee_config, "request_deadline", spy):
+                corvee.ApiClient("https://provider.example/v1", "k", timeout=7).call("GET", "/models")
+                self.assertEqual(seen, [])
+                with self.assertRaises(corvee_config.ConfigError):
+                    corvee_config.fetch_models("https://provider.example/v1", "k", 9)
+                self.assertEqual(seen, [9])
 
 
 if __name__ == "__main__":
