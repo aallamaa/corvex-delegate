@@ -2091,5 +2091,60 @@ class DelegationEconomicsTest(unittest.TestCase):
         self.assertGreater(journal.economics["delegate_tool_bytes"], 0)
 
 
+class InvocationErrorTest(unittest.TestCase):
+    """A bad path on the command line is a user error, not a crash. Every one
+    of these printed a raw Python traceback before."""
+
+    def run_cli(self, *extra):
+        with tempfile.TemporaryDirectory() as directory:
+            mission = Path(directory) / "mission.md"
+            mission.write_text("inspect only", encoding="utf-8")
+            argv = ["python3", str(SCRIPT), "--no-config", "--model", "m",
+                    "--mission", str(mission), "--cwd", directory, *extra]
+            return subprocess.run(
+                argv, env=os.environ | {"CORVEX_API_KEY": "k"},
+                capture_output=True, text=True,
+            )
+
+    def assert_clean_error(self, result, expected):
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn(expected, result.stderr)
+
+    def test_missing_mission_reports_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                ["python3", str(SCRIPT), "--no-config", "--model", "m",
+                 "--mission", "/nonexistent.md", "--cwd", directory],
+                env=os.environ | {"CORVEX_API_KEY": "k"}, capture_output=True, text=True,
+            )
+        self.assert_clean_error(result, "cannot read --mission")
+
+    def test_missing_working_directory_reports_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mission = Path(directory) / "mission.md"
+            mission.write_text("x", encoding="utf-8")
+            result = subprocess.run(
+                ["python3", str(SCRIPT), "--no-config", "--model", "m",
+                 "--mission", str(mission), "--cwd", "/nonexistent-directory"],
+                env=os.environ | {"CORVEX_API_KEY": "k"}, capture_output=True, text=True,
+            )
+        self.assert_clean_error(result, "cannot use --cwd")
+
+    def test_missing_env_file_reports_cleanly(self) -> None:
+        self.assert_clean_error(
+            self.run_cli("--env-file", "/nonexistent.env"), "cannot read --env-file"
+        )
+
+    def test_missing_model_config_reports_cleanly(self) -> None:
+        self.assert_clean_error(
+            self.run_cli("--model-config", "/nonexistent.json"), "cannot read --model-config"
+        )
+
+    def test_unusable_arguments_exit_two(self) -> None:
+        # Documented alongside 0/1/3/75/124/130; it was reachable but unlisted.
+        self.assertEqual(self.run_cli("--max-steps", "0").returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

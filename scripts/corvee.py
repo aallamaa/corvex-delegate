@@ -963,19 +963,19 @@ def main() -> int:
         fail(str(exc))
     env_file_values: dict[str, str] = {}
     if args.env_file:
-        env_path = args.env_file.resolve(strict=True)
         try:
+            env_path = args.env_file.resolve(strict=True)
             env_file_values = load_env_file(env_path)
         except (OSError, ConfigError) as exc:
-            fail(str(exc))
+            fail(f"cannot read --env-file {args.env_file}: {exc}")
 
     model_config_value = ""
     if args.model_config:
-        model_config_path = args.model_config.resolve(strict=True)
         try:
+            model_config_path = args.model_config.resolve(strict=True)
             model_config = json.loads(model_config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            fail(f"invalid model configuration: {exc}")
+            fail(f"cannot read --model-config {args.model_config}: {exc}")
         if not isinstance(model_config, dict) or set(model_config) != {"model"}:
             fail("model configuration must contain only a 'model' field")
         configured_model = model_config["model"]
@@ -1054,7 +1054,10 @@ def main() -> int:
     max_steps = args.max_steps or default_steps
     max_time = args.max_time or default_time
 
-    root = args.cwd.resolve(strict=True)
+    try:
+        root = args.cwd.resolve(strict=True)
+    except OSError as exc:
+        fail(f"cannot use --cwd {args.cwd}: {exc}")
     if not root.is_dir():
         fail(f"working directory is not a directory: {root}")
     resume_context: dict[str, Any] = {}
@@ -1083,7 +1086,10 @@ def main() -> int:
             if sorted(set(args.allow_command)) != resume_context["allowed_commands"]:
                 fail("resume failed: resume used mismatched --allow-command list")
     else:
-        mission_path = args.mission.resolve(strict=True)
+        try:
+            mission_path = args.mission.resolve(strict=True)
+        except OSError as exc:
+            fail(f"cannot read --mission {args.mission}: {exc}")
         if not mission_path.is_file():
             fail(f"mission is not a file: {mission_path}")
         if mission_path.stat().st_size > MAX_MISSION_BYTES:
@@ -1184,10 +1190,12 @@ def main() -> int:
 
 
 def measure_diff(root: Path) -> int | None:
-    """Size the working-tree diff the planner would have to read.
+    """Size the change this run left in the repository.
 
-    None means the size is unknown (no git, not a repository, git failed) and
-    is reported as such rather than as zero.
+    Measures the tree against HEAD, so staged work counts, plus the size of
+    untracked files, which no git diff reports. None means the size is unknown
+    (no git, not a repository, git failed) and is reported as such rather than
+    as zero.
     """
     git = shutil.which("git")
     if git is None:

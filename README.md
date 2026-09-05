@@ -87,7 +87,7 @@ To avoid redoing completed work after an interrupted or budget-exhausted run, us
 
 One transient API retry is allowed by default; `--request-retries 0` disables retries and `2` is the maximum. Retries may incur duplicate inference charges, stay within the original time budget, and never replay completed local tools. Authentication errors and invalid JSON are not retried.
 
-Repeated identical tool results or consecutive errors trigger a warning, then a tools-disabled wrap-up. The last model step is also reserved for reporting. A forced wrap-up is incomplete even when a report arrives. Exit codes: `0` report returned (not verified success), `3` incomplete wrap-up, `75` transient provider failure after retries, `124` budget exhausted, `130` interrupted, `1` other failure.
+Repeated identical tool results or consecutive errors trigger a warning, then a tools-disabled wrap-up. The last model step is also reserved for reporting. A forced wrap-up is incomplete even when a report arrives. Exit codes: `0` report returned (not verified success), `2` unusable arguments or configuration, `3` incomplete wrap-up, `75` transient provider failure after retries, `124` budget exhausted, `130` interrupted, `1` other failure.
 
 After failure, inspect `status.json`, `events.jsonl`, and the checkpoint before preparing a smaller follow-up mission. A `tool_pending` checkpoint means execution may have partially happened: inspect repository state before continuing. Use `--resume` to continue from the same run directory when safe. Hard interruptions such as SIGKILL cannot finalize status; use the last durable checkpoint as incomplete evidence.
 

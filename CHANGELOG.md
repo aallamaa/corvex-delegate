@@ -150,6 +150,17 @@ All notable changes to this skill are recorded here. This project follows
 
 ### Fixed (runner)
 
+- A missing `--mission`, `--cwd`, `--env-file` or `--model-config` path printed
+  a raw `FileNotFoundError` traceback instead of a message. `resolve(strict=True)`
+  raised before the guard beneath it could report anything. All four now fail
+  with a readable line and exit 2.
+- Exit 2 is reachable from `run` for unusable arguments but was missing from
+  the documented exit-code table.
+- `measure_diff`'s docstring still described "the working-tree diff the planner
+  would have to read", from the removed leverage metric. It measures the tree
+  against HEAD plus untracked files, and the runner cannot see what the planner
+  reads.
+
 - A retryable provider failure inside the reporting reserve aborted with exit
   124 before the wrap-up prompt was ever sent, discarding the partial report
   the reserve exists to buy.
