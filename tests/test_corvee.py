@@ -1958,6 +1958,24 @@ class StallGuardTest(unittest.TestCase):
         # same batch is answered with an error instead of being run.
         self.assertEqual(len(executed), 3)
 
+    def test_a_read_only_directory_is_removed_identically_on_every_version(self) -> None:
+        # The old implementation handed shutil.rmtree an error handler, which
+        # receives a different path on 3.11 than on 3.12+; it passed on one and
+        # failed on the other for two months of green-looking local runs.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tree"
+            (root / "inner").mkdir(parents=True)
+            (root / "inner" / "file.json").write_text("{}", encoding="utf-8")
+            (root / "inner").chmod(0o500)
+            root.chmod(0o500)
+            try:
+                corvee._remove_report_dir(root)
+            finally:
+                for path in (root / "inner", root):
+                    if path.exists():
+                        path.chmod(0o700)
+            self.assertFalse(root.exists())
+
     def test_permission_denied_directories_are_still_removed(self) -> None:
         # A read-only directory needs its own mode relaxed before its children
         # can be unlinked; chmod-ing the failing child is not enough.

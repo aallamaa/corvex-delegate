@@ -5,6 +5,18 @@ All notable changes to this skill are recorded here. This project follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Report cleanup failed on Python 3.11, so CI had been red on that leg for ten
+  commits. `_remove_report_dir` handed `shutil.rmtree` an error handler, but
+  rmtree reports a permission failure against the *child* it could not unlink,
+  and relaxing that child's mode does not help -- the missing write bit is on
+  the parent directory. Which path the handler receives also differs between
+  3.11 and 3.12+, so the same code passed on one and failed on the other. The
+  tree is now walked directly by `_force_remove_tree`, which relaxes each
+  directory before descending into it, and the version branch is gone. A test
+  covers a read-only directory nested inside a read-only directory.
+
 ### Changed
 
 - The delegate can no longer run commands. `run_command`, `--allow-command`,

@@ -408,15 +408,18 @@ def _force_remove_tree(path: Path, depth: int = 0) -> None:
     os.rmdir(path)
 
 
-def _remove_readonly_onexc(_func: Any, path: Any, _exc: Any) -> None:
-    _force_remove_tree(Path(path))
-
-
 def _remove_report_dir(directory: Path) -> None:
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(directory, onexc=_remove_readonly_onexc)
-    else:
-        shutil.rmtree(directory, onerror=_remove_readonly_onexc)
+    """Remove a report tree, including one whose own mode forbids it.
+
+    This walks the tree itself rather than handing shutil.rmtree an error
+    handler. rmtree reports the failure against the *child* it could not
+    unlink, and relaxing that child's mode does not help: it is the parent
+    directory's write bit that is missing. Worse, which path the handler
+    receives differs between 3.11 and 3.12+, so the handler approach passed on
+    one and failed on the other. _force_remove_tree relaxes each directory
+    before descending into it, which is the operation actually required.
+    """
+    _force_remove_tree(directory)
 
 
 def cleanup_reports(
