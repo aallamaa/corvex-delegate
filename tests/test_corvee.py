@@ -1986,5 +1986,76 @@ class UsageAccountingTest(unittest.TestCase):
         self.assertEqual(journal.usage["total_tokens"], 15)
 
 
+class DelegationEconomicsTest(unittest.TestCase):
+    """Delegating pays only when the delegate reads a lot and the planner
+    reads a little. Record both sides so that is checkable, not assumed."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.run_dir = Path(self.directory.name) / "run"
+
+    def test_leverage_is_delegate_reading_over_planner_reading(self) -> None:
+        journal = corvee.RunJournal(self.run_dir, "secret")
+        for _ in range(30):
+            journal.record_tool_result("x" * 4_000)
+        (self.run_dir / "report.md").write_text("x" * 900, encoding="utf-8")
+        journal.economics["diff_bytes"] = 1_200
+        journal.finish("report_returned", 0)
+        economics = json.loads(
+            (self.run_dir / "status.json").read_text(encoding="utf-8")
+        )["economics"]
+        self.assertEqual(economics["delegate_tool_bytes"], 120_000)
+        self.assertEqual(economics["delegate_tool_calls"], 30)
+        self.assertEqual(economics["planner_review_bytes"], 2_100)
+        self.assertAlmostEqual(economics["leverage"], 57.14, places=1)
+
+    def test_a_verbose_report_on_little_work_shows_leverage_below_one(self) -> None:
+        journal = corvee.RunJournal(self.run_dir, "secret")
+        journal.record_tool_result("x" * 200)
+        (self.run_dir / "report.md").write_text("x" * 5_000, encoding="utf-8")
+        journal.economics["diff_bytes"] = 0
+        journal.finish("report_returned", 0)
+        economics = json.loads(
+            (self.run_dir / "status.json").read_text(encoding="utf-8")
+        )["economics"]
+        self.assertLess(economics["leverage"], 1)
+
+    def test_an_unmeasurable_diff_is_null_rather_than_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            # Not a git repository, so the diff size is unknown.
+            self.assertIsNone(corvee.measure_diff(Path(directory)))
+
+    def test_a_measurable_diff_is_counted(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            tracked = root / "tracked.txt"
+            tracked.write_text("original\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "-c", "user.email=t@e", "-c", "user.name=t",
+                            "commit", "-qm", "seed"], cwd=root, check=True)
+            self.assertEqual(corvee.measure_diff(root), 0)
+            tracked.write_text("changed\n", encoding="utf-8")
+            self.assertGreater(corvee.measure_diff(root), 0)
+
+    def test_run_steps_counts_every_tool_result(self) -> None:
+        tools = corvee.RepositoryTools(Path.cwd(), False, set())
+        client = corvee.ApiClient("https://example.com", "fake")
+        call = {"id": "c1", "function": {"name": "list_files", "arguments": "{}"}}
+        responses = [
+            {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]},
+            {"choices": [{"message": {"role": "assistant", "content": "done"}}]},
+        ]
+        journal = corvee.RunJournal(self.run_dir, "secret")
+        with patch.object(client, "call", side_effect=responses):
+            with patch.object(tools, "execute", return_value='{"ok":true,"result":"listing"}'):
+                corvee.run_steps(client, tools, [], "mock", None, 4, 100, journal=journal)
+        self.assertEqual(journal.economics["delegate_tool_calls"], 1)
+        self.assertGreater(journal.economics["delegate_tool_bytes"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

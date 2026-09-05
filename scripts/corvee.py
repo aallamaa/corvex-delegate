@@ -136,6 +136,36 @@ class RunJournal:
         # report budget consumed, so the runner has to actually measure it.
         self.usage = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
                       "total_tokens": 0, "reported_by_provider": False}
+        # The point of delegating is that the delegate reads a lot so the
+        # planner reads a little. Record both sides so that ratio is visible
+        # instead of assumed.
+        self.economics = {
+            "mission_bytes": 0,
+            "delegate_tool_bytes": 0,
+            "delegate_tool_calls": 0,
+            "report_bytes": 0,
+            "diff_bytes": None,
+        }
+    def record_tool_result(self, result: str) -> None:
+        self.economics["delegate_tool_calls"] += 1
+        self.economics["delegate_tool_bytes"] += len(result.encode("utf-8"))
+
+    def review_burden(self) -> dict[str, Any]:
+        """What the planner must read, against what the delegate absorbed.
+
+        Leverage below 1 means the planner reads more than the delegate
+        processed, which is the shape where delegating costs more than doing
+        the work directly.
+        """
+        economics = dict(self.economics)
+        planner_bytes = economics["report_bytes"] + (economics["diff_bytes"] or 0)
+        economics["planner_review_bytes"] = planner_bytes
+        economics["leverage"] = (
+            round(economics["delegate_tool_bytes"] / planner_bytes, 2)
+            if planner_bytes else None
+        )
+        return economics
+
     def record_usage(self, usage: Any) -> dict[str, int]:
         """Accumulate one response's token counts, ignoring absent or odd values.
 
@@ -186,9 +216,12 @@ class RunJournal:
 
     def finish(self, status: str, code: int):
         self.checkpoint(self.messages, self.phase)
+        report_path = self.directory / "report.md"
+        if report_path.exists():
+            self.economics["report_bytes"] = report_path.stat().st_size
         protected_write(self.directory / "status.json", json.dumps({
             "status": status, "exit_code": code, "step": self.step, "phase": self.phase,
-            "usage": self.usage,
+            "usage": self.usage, "economics": self.review_burden(),
         }))
         self.event("run_end", status=status, exit_code=code)
         report = self.directory / "report.md"
@@ -1064,6 +1097,7 @@ def main() -> int:
         if mission_path.stat().st_size > MAX_MISSION_BYTES:
             fail(f"mission exceeds {MAX_MISSION_BYTES} bytes")
         mission = mission_path.read_text(encoding="utf-8")
+        mission_bytes = mission_path.stat().st_size
         system = (
             "You are a bounded repository delegate. Execute only the supplied mission. "
             "Use tools to inspect evidence before conclusions. Do not expand scope, access credentials, "
@@ -1129,6 +1163,7 @@ def main() -> int:
         if "allowed_commands" in resume_context:
             journal.run_context["allowed_commands"] = resume_context["allowed_commands"]
     if not args.resume:
+        journal.economics["mission_bytes"] = mission_bytes
         journal.checkpoint(messages, "ready")
     else:
         journal.step = max(1, start_step - 1)
@@ -1151,8 +1186,27 @@ def main() -> int:
     except Exception:
         journal.finish("internal_error", 1)
         fail("Runner failed; inspect private run artifacts", 1)
+    journal.economics["diff_bytes"] = measure_diff(root) if args.write else 0
     journal.finish("report_returned" if code == 0 else "incomplete", code)
     return code
+
+
+def measure_diff(root: Path) -> int | None:
+    """Size the working-tree diff the planner would have to read.
+
+    None means the size is unknown (no git, not a repository, git failed) and
+    is reported as such rather than as zero.
+    """
+    git = shutil.which("git")
+    if git is None:
+        return None
+    try:
+        result = run_process([git, "diff"], cwd=root, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return len(result.stdout.encode("utf-8"))
 
 
 def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
@@ -1296,6 +1350,8 @@ def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
                           json.dumps({"ok": False, "error": "tools stopped; report required"}))
             except (json.JSONDecodeError, ValueError) as exc:
                 result = json.dumps({"ok": False, "error": f"invalid tool call: {exc}"})
+            if journal:
+                journal.record_tool_result(result)
             messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
             checkpoint("tool_completed")
             ok = json.loads(result).get("ok", False)

@@ -26,8 +26,9 @@ Create or update these files with normal Codex file-editing tools. Do not store 
 One observable end state.
 
 ## Acceptance gates
-- [ ] G1: binary pass/fail condition and its evidence source
-- [ ] G2: binary pass/fail condition and its evidence source
+- [ ] G1: `command that exits 0 when this gate passes`
+- [ ] G2: `command that exits 0 when this gate passes`
+- [ ] G3: condition that genuinely cannot be a command, and how to judge it
 
 ## Constraints
 Authorized scope, compatibility requirements, and invariants.
@@ -36,11 +37,13 @@ Authorized scope, compatibility requirements, and invariants.
 Explicit exclusions.
 
 ## Verification
-Commands, inspections, or artifacts Codex can independently evaluate.
+How to run the gate commands, including any setup they need.
 
 ## Loop budget
 Maximum iterations and optional time or cost boundary.
 ```
+
+Write a gate as a command whenever one exists. A command costs the planner one exit code to check no matter how much work the delegate did, while a gate phrased as a judgement costs a full reading of the change. That difference is the whole economics of delegating: keep the planner's verification cost flat as the delegated volume grows. Reserve prose gates for what genuinely cannot be executed, such as an interface being coherent, and expect them to be the expensive ones.
 
 `STATE.md` records the current status, next unmet gate, iterations, delegate reports, primary-Codex verification, blockers, and target changes. Append iteration evidence; do not rewrite failed history into a success narrative.
 
@@ -87,7 +90,7 @@ Perform a read-only gap analysis against the current target:
 - distinguish facts from hypotheses;
 - update `STATE.md`, but do not edit product code.
 
-A read-only delegate may gather repository evidence. The primary Codex agent must synthesize the plan.
+Delegate the reading. A read-only delegate should gather the evidence and draft the work units; exploring a repository is the most token-heavy step in the loop and the one worth moving off the planner. The planner accepts, reorders or rejects that draft and owns the result, but should not re-read the repository to produce it.
 
 ### `refine`
 
@@ -100,9 +103,16 @@ Execute exactly one controlled iteration:
 1. select the highest-leverage unmet gate whose prerequisites are satisfied;
 2. create one bounded mission;
 3. run one delegate, or a small read-only fan-out for genuinely independent analysis;
-4. inspect the report and diff;
-5. independently verify the affected gate;
+4. rerun the gate command yourself and read its exit code;
+5. read the change only to the extent the gate does not cover it. When the diff
+   is larger than roughly a screen, delegate the reading (see `review` below)
+   and read the reviewer's verdict instead;
 6. update `STATE.md` and stop after reporting the next state.
+
+Step 4 is not optional and is not delegable: the delegate's own claim that a
+check passed is evidence, not proof. Step 5 is where planner cost is won or
+lost. Reading a whole diff makes the planner's spend grow with the delegate's
+output, which is the shape delegation exists to avoid.
 
 Use a fresh direct-runner context for each mission. A failed or timed-out run may have left partial edits; inspect before retrying. Capture the report and exit status in `reports/`. Do not include credential values or environment dumps.
 
@@ -132,9 +142,22 @@ After each iteration, reconsider the next unit from current evidence. Do not rep
 
 A timeout is not success. Partial progress remains recorded and the target stays incomplete.
 
+### `review`
+
+Delegate the reading of a change. Run a fresh read-only mission whose scope is
+the current diff and whose objective is to report, per hunk: what changed,
+whether it is inside the mission's authorised scope, anything unrelated that
+was touched, and any defect it can support with evidence. It receives the
+target and the diff but not the implementing delegate's report or conclusions.
+
+The planner then reads a verdict of a few hundred bytes rather than the diff
+itself, and still reruns the gate commands. Use it whenever the diff is large
+enough that reading it would dominate the iteration's planner cost. Do not use
+it to replace step 4, and do not treat a clean review as a passing gate.
+
 ### `audit`
 
-Try to falsify the current completion claim. Prefer a fresh read-only delegate mission that receives the target and artifacts but not the previous delegate's conclusions. The primary Codex agent reviews the result and runs decisive checks. Reopen any gate contradicted by stronger evidence.
+Try to falsify the current completion claim. Prefer a fresh read-only delegate mission that receives the target and artifacts but not the previous delegate's conclusions. The primary Codex agent reruns the gate commands and reads the falsification report, not the whole change. Reopen any gate contradicted by stronger evidence.
 
 ### `status`
 
