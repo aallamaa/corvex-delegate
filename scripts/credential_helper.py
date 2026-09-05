@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 import sys
 
-from corvex_delegate_config import ConfigError, default_config_path, load_config, resolve_api_key
+from corvee_config import ConfigError, default_config_path, load_config, resolve_api_key
 
 
 def main() -> int:

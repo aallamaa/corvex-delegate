@@ -10,12 +10,12 @@ PACKAGE_FILES = (
     "SKILL.md", "README.md", "LICENSE", "VERSION", "agents/openai.yaml",
     "references/control-protocol.md", "references/mission-format.md",
     "references/provider-setup.md", "references/native-compatibility.md",
-    "scripts/corvex-delegate", "scripts/corvex_delegate.py",
-    "scripts/corvex_delegate_config.py", "scripts/configure_delegate.py",
+    "scripts/corvee", "scripts/corvee.py",
+    "scripts/corvee_config.py", "scripts/configure_corvee.py",
     "scripts/install.py", "scripts/package.py", "scripts/native_agent.py",
     "scripts/credential_helper.py",
 )
-TEST_FILES = ("tests/test_corvex_delegate.py", "tests/fixtures/live_readonly_mission.md")
+TEST_FILES = ("tests/test_corvee.py", "tests/fixtures/live_readonly_mission.md")
 
 
 def checked_files(root: Path, include_tests: bool = False):
@@ -34,10 +34,10 @@ def main() -> None:
     resources = list(checked_files(root, include_tests=True))
     destination = root / "dist"
     destination.mkdir(exist_ok=True)
-    archive = destination / f"corvex-delegate-{version}.tar.gz"
+    archive = destination / f"corvee-{version}.tar.gz"
     with tarfile.open(archive, "w:gz") as bundle:
         for name, path in resources:
-            bundle.add(path, arcname=f"corvex-delegate/{name}", recursive=False)
+            bundle.add(path, arcname=f"corvee/{name}", recursive=False)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     checksum = archive.with_name(archive.name + ".sha256")
     checksum.write_text(f"{digest}  {archive.name}\n")

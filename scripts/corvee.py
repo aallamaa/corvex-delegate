@@ -4,20 +4,24 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from typing import Any
 from urllib import error, request
 
-from corvex_delegate_config import (
+from corvee_config import (
     ConfigError,
     DEFAULT_API_KEY_ENV,
     DEFAULT_BASE_URL,
@@ -27,11 +31,65 @@ from corvex_delegate_config import (
     resolve_api_key,
     validate_base_url,
     open_request,
+    atomic_write as protected_write,
 )
 
 
 MAX_FILE_BYTES = 200_000
 MAX_TOOL_OUTPUT = 30_000
+
+
+class ProviderFailure(Exception):
+    def __init__(self, category: str, retryable: bool = False):
+        super().__init__(category)
+        self.retryable = retryable
+
+
+class RunJournal:
+    """Private checkpoints contain repository content; events contain metadata only."""
+    def __init__(self, directory: Path, api_key: str):
+        self.directory = directory
+        directory.mkdir(parents=True, mode=0o700, exist_ok=False)
+        self.api_key = api_key
+        self.started = time.monotonic()
+        self.step = 0
+        self.messages = []
+        self.phase = "starting"
+        self.events = directory / "events.jsonl"
+        self.events.touch(mode=0o600, exist_ok=False)
+
+    def redact(self, text: str) -> str:
+        return text.replace(self.api_key, "[REDACTED]") if self.api_key else text
+
+    def event(self, event: str, **fields):
+        record = {"event": event, "elapsed_seconds": round(time.monotonic() - self.started, 3),
+                  "step": self.step, **fields}
+        line = self.redact(json.dumps(record, ensure_ascii=False))
+        with self.events.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+            handle.flush()
+        print(line, file=sys.stderr, flush=True)
+
+    def checkpoint(self, messages, phase: str):
+        self.messages = messages
+        self.phase = phase
+        protected_write(self.directory / "checkpoint.json", self.redact(json.dumps({
+            "version": 1, "step": self.step, "phase": phase, "messages": messages,
+            "automatic_replay_safe": False,
+        }, ensure_ascii=False)))
+
+    def finish(self, status: str, code: int):
+        self.checkpoint(self.messages, self.phase)
+        protected_write(self.directory / "status.json", json.dumps({
+            "status": status, "exit_code": code, "step": self.step, "phase": self.phase,
+        }))
+        self.event("run_end", status=status, exit_code=code)
+        report = self.directory / "report.md"
+        if not report.exists():
+            protected_write(report, f"# Incomplete run\n\nStatus: {status}; exit code: {code}.\n"
+                            f"Last step: {self.step}; phase: {self.phase}.\n"
+                            "No final model report was received. Inspect checkpoint.json and events.jsonl. "
+                            "Do not replay pending tools without checking repository state.\n")
 
 
 def fail(message: str, code: int = 2) -> None:
@@ -61,8 +119,47 @@ def truncate(value: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     return value[:limit] + f"\n[truncated {len(value) - limit} characters]"
 
 
+@contextmanager
+def execution_deadline(seconds: float):
+    """Enforce a wall-clock budget, including blocking HTTP and file operations."""
+    def expired(signum, frame):
+        fail("delegate exceeded max time", 124)
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        if previous_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL,
+                             max(0.000001, previous_timer[0] - (time.monotonic() - started)),
+                             previous_timer[1])
+
+
+def run_process(argv, *, timeout, check=False, capture_output=True, text=True, **kwargs):
+    """Terminate the command's process group on timeout or runner interruption."""
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=text, start_new_session=True, **kwargs) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+        if check:
+            result.check_returncode()
+        return result
+
+
 class ApiClient:
-    def __init__(self, base_url: str, api_key: str, timeout: int = 120) -> None:
+    def __init__(self, base_url: str, api_key: str, timeout: int = 600) -> None:
         self.base_url = validate_base_url(base_url)
         self.api_key = api_key
         self.timeout = timeout
@@ -72,7 +169,7 @@ class ApiClient:
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": "codex-corvex-delegate/1",
+            "User-Agent": "codex-corvee/1",
         }
         if body is not None:
             headers["Content-Type"] = "application/json"
@@ -83,20 +180,29 @@ class ApiClient:
             with open_request(req, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except error.HTTPError as exc:
-            detail = exc.read(MAX_TOOL_OUTPUT).decode("utf-8", errors="replace")
-            detail = detail.replace(self.api_key, "[REDACTED]")
-            fail(f"Provider HTTP {exc.code}: {truncate(detail)}", 1)
+            exc.close()
+            raise ProviderFailure(f"http_{exc.code}", exc.code in {408, 429, 500, 502, 503, 504}) from None
+        except TimeoutError:
+            raise ProviderFailure("request_timeout", True) from None
         except error.URLError as exc:
-            fail(f"Provider request failed: {exc.reason}", 1)
-        except json.JSONDecodeError:
-            fail("Provider returned invalid JSON", 1)
+            raise ProviderFailure("request_timeout" if isinstance(exc.reason, TimeoutError)
+                                  else "connection_error", True) from None
+        except (ConnectionError, OSError):
+            raise ProviderFailure("connection_error", True) from None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ProviderFailure("invalid_json") from None
 
 
 class RepositoryTools:
     def __init__(self, root: Path, write: bool, allowed_commands: set[str]) -> None:
         self.root = root.resolve()
         self.write = write
-        self.allowed_commands = allowed_commands
+        self.allowed_commands = {}
+        for name in allowed_commands:
+            executable = shutil.which(name)
+            if executable is None:
+                raise ValueError(f"allow-listed executable not found: {name}")
+            self.allowed_commands[name] = str(Path(executable).resolve(strict=True))
 
     def safe_path(self, value: str, *, allow_missing: bool = False) -> Path:
         candidate = Path(value)
@@ -241,6 +347,8 @@ class RepositoryTools:
             return json.dumps({"ok": False, "error": f"invalid tool arguments: {exc}"})
 
     def tool_read_file(self, path: str, start_line: int = 1, line_count: int = 300) -> str:
+        if type(start_line) is not int or start_line < 1 or type(line_count) is not int or not 1 <= line_count <= 1000:
+            raise ValueError("start_line must be positive and line_count must be between 1 and 1000")
         target = self.safe_path(path)
         if target.stat().st_size > MAX_FILE_BYTES:
             raise ValueError(f"file exceeds {MAX_FILE_BYTES} byte read limit: {path}")
@@ -251,7 +359,7 @@ class RepositoryTools:
     def tool_list_files(self, glob: str = "*") -> str:
         rg = shutil.which("rg")
         if rg:
-            result = subprocess.run(
+            result = run_process(
                 [rg, "--files", "-g", glob],
                 cwd=self.root,
                 text=True,
@@ -275,9 +383,9 @@ class RepositoryTools:
     def tool_search_text(self, pattern: str, glob: str = "*") -> str:
         rg = shutil.which("rg")
         if not rg:
-            raise ValueError("search_text requires ripgrep (rg)")
-        result = subprocess.run(
-            [rg, "-n", "--no-heading", "--color", "never", "-g", glob, pattern, "."],
+            return self.grep_search(pattern, glob)
+        result = run_process(
+            [rg, "-n", "--no-heading", "--color", "never", "-g", glob, "-e", pattern, "--", "."],
             cwd=self.root,
             text=True,
             capture_output=True,
@@ -287,6 +395,35 @@ class RepositoryTools:
         if result.returncode not in (0, 1):
             raise ValueError(result.stderr.strip() or "rg failed")
         return result.stdout
+
+    def grep_search(self, pattern: str, glob: str) -> str:
+        grep = shutil.which("grep")
+        if not grep:
+            raise ValueError("search_text requires ripgrep (rg) or grep")
+        output = []
+        size = 0
+        # Explicit files avoid recursive grep following symlinks outside the root.
+        for directory, dirs, files in os.walk(self.root, followlinks=False):
+            dirs[:] = sorted(name for name in dirs if not name.startswith("."))
+            for name in sorted(files):
+                candidate = Path(directory) / name
+                relative = str(candidate.relative_to(self.root))
+                if name.startswith(".") or candidate.is_symlink() or not candidate.is_file():
+                    continue
+                if not (fnmatch.fnmatch(relative, glob) or fnmatch.fnmatch(name, glob)):
+                    continue
+                path = self.safe_path(relative)
+                result = run_process(
+                    [grep, "-nH", "-I", "-E", "-e", pattern, "--", str(path)],
+                    cwd=self.root, text=True, capture_output=True, timeout=30,
+                )
+                if result.returncode not in (0, 1):
+                    raise ValueError(result.stderr.strip() or "grep failed")
+                output.append(result.stdout)
+                size += len(result.stdout)
+                if size > MAX_TOOL_OUTPUT:
+                    return truncate("".join(output))
+        return "".join(output)
 
     def tool_git_status(self) -> str:
         return self.fixed_command(["git", "status", "--short", "--branch"])
@@ -303,19 +440,30 @@ class RepositoryTools:
     ) -> str:
         if not self.write:
             raise ValueError("write tools are disabled")
+        if not old_text:
+            raise ValueError("old_text must be non-empty")
+        if type(expected_occurrences) is not int or not 1 <= expected_occurrences <= 100:
+            raise ValueError("expected_occurrences must be between 1 and 100")
         target = self.safe_path(path)
+        if target.stat().st_size > MAX_FILE_BYTES:
+            raise ValueError(f"file exceeds {MAX_FILE_BYTES} byte edit limit")
         original = target.read_text(encoding="utf-8")
         actual = original.count(old_text)
         if actual != expected_occurrences:
             raise ValueError(
                 f"expected {expected_occurrences} occurrences, found {actual}; no change made"
             )
-        self.atomic_write(target, original.replace(old_text, new_text))
+        replacement = original.replace(old_text, new_text)
+        if len(replacement.encode("utf-8")) > MAX_FILE_BYTES:
+            raise ValueError(f"replacement exceeds {MAX_FILE_BYTES} byte edit limit")
+        self.atomic_write(target, replacement)
         return f"replaced {actual} occurrence(s) in {target.relative_to(self.root)}"
 
     def tool_write_file(self, path: str, content: str) -> str:
         if not self.write:
             raise ValueError("write tools are disabled")
+        if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+            raise ValueError(f"content exceeds {MAX_FILE_BYTES} byte write limit")
         target = self.safe_path(path, allow_missing=True)
         target.parent.mkdir(parents=True, exist_ok=True)
         self.atomic_write(target, content)
@@ -326,9 +474,11 @@ class RepositoryTools:
     ) -> str:
         if not argv or not all(isinstance(item, str) and item for item in argv):
             raise ValueError("argv must contain non-empty strings")
-        executable = Path(argv[0]).name
-        if executable not in self.allowed_commands:
-            raise ValueError(f"executable is not allow-listed: {executable}")
+        executable = self.allowed_commands.get(argv[0])
+        if executable is None:
+            raise ValueError(f"executable is not allow-listed: {argv[0]}")
+        if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 900:
+            raise ValueError("timeout_seconds must be an integer between 1 and 900")
         command_cwd = self.safe_path(cwd)
         if not command_cwd.is_dir():
             raise ValueError(f"command cwd is not a directory: {cwd}")
@@ -337,8 +487,8 @@ class RepositoryTools:
             for key, value in os.environ.items()
             if not any(marker in key.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
         }
-        result = subprocess.run(
-            argv,
+        result = run_process(
+            [executable, *argv[1:]],
             cwd=command_cwd,
             text=True,
             capture_output=True,
@@ -353,7 +503,7 @@ class RepositoryTools:
         )
 
     def fixed_command(self, argv: list[str]) -> str:
-        result = subprocess.run(
+        result = run_process(
             argv, cwd=self.root, text=True, capture_output=True, timeout=30, check=False
         )
         if result.returncode != 0:
@@ -404,7 +554,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-command", action="append", default=[])
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--max-time", type=parse_duration)
-    parser.add_argument("--http-timeout", type=int, default=120)
+    parser.add_argument("--http-timeout", type=int, default=600,
+                        help="Per-request socket timeout in seconds (default: 600), capped by run budget")
+    parser.add_argument("--request-retries", type=int, default=1,
+                        help="Transient request retries (0-2); may incur duplicate inference charges")
+    parser.add_argument("--run-dir", type=Path, help="New private artifact directory; must not exist")
     parser.add_argument("--models", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -469,12 +623,15 @@ def main() -> int:
     if not api_key:
         fail(
             "Corvex API credential is not configured. Run "
-            "scripts/corvex-delegate configure or set CORVEX_API_KEY."
+            "scripts/corvee configure or set CORVEX_API_KEY."
         )
     client = ApiClient(base_url, api_key, timeout=args.http_timeout)
 
     if args.models:
-        response = client.call("GET", "/models")
+        try:
+            response = client.call("GET", "/models")
+        except ProviderFailure as exc:
+            fail(f"Provider request failed: {exc}", 1)
         models = response.get("data", []) if isinstance(response, dict) else []
         ids = sorted(
             item.get("id", "") for item in models if isinstance(item, dict) and item.get("id")
@@ -485,13 +642,15 @@ def main() -> int:
         return 0
 
     if not model:
-        fail("Select a Corvex model with $corvex-delegate select or pass --model")
+        fail("Select a Corvex model with $corvee select or pass --model")
     if args.mission is None:
         fail("--mission is required unless --models is used")
     if args.max_steps is not None and args.max_steps < 1:
         fail("--max-steps must be positive")
     if args.http_timeout < 1:
         fail("--http-timeout must be positive")
+    if not 0 <= args.request_retries <= 2:
+        fail("--request-retries must be between 0 and 2")
 
     complexity = args.complexity or config.get("default_complexity") or "medium"
     if complexity not in {"low", "medium", "high"}:
@@ -547,24 +706,111 @@ def main() -> int:
         {"role": "system", "content": system},
         {"role": "user", "content": f"Repository root: {root}\n\nMission:\n{mission}"},
     ]
+    directory = (args.run_dir.expanduser().resolve() if args.run_dir else
+                 root / ".codex" / "corvee" / "reports" / uuid.uuid4().hex)
+    try:
+        journal = RunJournal(directory, api_key)
+    except OSError as exc:
+        fail(f"cannot create private run directory: {exc}")
+    print(f"Run artifacts: {directory}", file=sys.stderr, flush=True)
+    journal.checkpoint(messages, "ready")
+    journal.event("run_start", model=model, max_steps=max_steps, max_time_seconds=max_time)
+    try:
+        with execution_deadline(max_time):
+            code = run_steps(client, tools, messages, model, args.effort, max_steps, max_time,
+                             journal=journal, request_retries=args.request_retries)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        journal.finish("budget_exhausted" if code == 124 else "failed", code)
+        raise
+    except KeyboardInterrupt:
+        journal.finish("interrupted", 130)
+        return 130
+    except Exception:
+        journal.finish("internal_error", 1)
+        fail("Runner failed; inspect private run artifacts", 1)
+    journal.finish("report_returned" if code == 0 else "incomplete", code)
+    return code
+
+
+def run_steps(client, tools, messages, model, effort, max_steps, max_time, *,
+              journal=None, request_retries=1):
     started = time.monotonic()
+    deadline = started + max_time
+    request_timeout = client.timeout
+    reserve = min(request_timeout, max_time * 0.2)
+    repeated = {}
+    error_streak = 0
+    stop_reason = None
+    allowed_names = {tool["function"]["name"] for tool in tools.schemas()}
+
+    def event(name, **fields):
+        if journal:
+            journal.event(name, **fields)
+
+    def checkpoint(phase):
+        if journal:
+            journal.checkpoint(messages, phase)
 
     for step in range(1, max_steps + 1):
+        if journal:
+            journal.step = step
         if time.monotonic() - started >= max_time:
             fail(f"delegate exceeded max time after {step - 1} steps", 124)
+        if stop_reason is None and (step == max_steps or deadline - time.monotonic() <= reserve):
+            stop_reason = "step_budget" if step == max_steps else "time_reserve"
+        if stop_reason:
+            messages.append({"role": "user", "content":
+                f"Execution stopped ({stop_reason}). Tools are disabled. Return a concise partial "
+                "evidence report now, including uncertainties and unverified work. Do not claim completion."})
+            event("wrap_up", reason=stop_reason)
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "tools": tools.schemas(),
-            "tool_choice": "auto",
+            "tool_choice": "none" if stop_reason else "auto",
         }
-        if args.effort:
-            payload["reasoning_effort"] = args.effort
-        response = client.call("POST", "/chat/completions", payload)
+        if effort:
+            payload["reasoning_effort"] = effort
+        checkpoint("request_pending")
+        response = None
+        for attempt in range(request_retries + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("delegate exceeded max time", 124)
+            request_budget = remaining if stop_reason else remaining - reserve
+            if request_budget <= 0:
+                stop_reason = "time_reserve"
+                break
+            client.timeout = min(request_timeout, request_budget)
+            event("request_start", attempt=attempt + 1, remaining_seconds=round(remaining, 2))
+            request_started = time.monotonic()
+            try:
+                response = client.call("POST", "/chat/completions", payload)
+                event("request_end", duration_seconds=round(time.monotonic() - request_started, 3))
+                break
+            except ProviderFailure as exc:
+                event("request_error", category=str(exc), retryable=exc.retryable)
+                if exc.retryable and not stop_reason and deadline - time.monotonic() <= reserve:
+                    stop_reason = "time_reserve"
+                    break
+                if not exc.retryable or attempt == request_retries:
+                    fail(f"Provider request failed: {exc}", 75 if exc.retryable else 1)
+                delay = 2 ** attempt
+                if deadline - time.monotonic() <= delay:
+                    fail("delegate exhausted retry time budget", 124)
+                event("request_retry", delay_seconds=delay)
+                time.sleep(delay)
+        if response is None:
+            continue
+        if time.monotonic() - started >= max_time:
+            fail("delegate exceeded max time", 124)
         try:
             message = response["choices"][0]["message"]
         except (KeyError, IndexError, TypeError):
-            fail(f"provider response has no assistant message: {truncate(json.dumps(response))}", 1)
+            fail("provider response has no assistant message", 1)
+        if not isinstance(message, dict):
+            fail("provider assistant message is not an object", 1)
         assistant_message: dict[str, Any] = {
             "role": "assistant",
             "content": message.get("content"),
@@ -573,29 +819,63 @@ def main() -> int:
         if tool_calls:
             assistant_message["tool_calls"] = tool_calls
         messages.append(assistant_message)
+        checkpoint("response_received")
 
         if not tool_calls:
             content = message.get("content")
             if not isinstance(content, str) or not content.strip():
                 fail("provider returned neither tool calls nor a final text report", 1)
-            print(content)
-            return 0
+            if journal:
+                protected_write(journal.directory / "report.md", journal.redact(
+                    (f"# Incomplete: {stop_reason}\n\n" if stop_reason else "") + content))
+            print((f"Incomplete ({stop_reason}):\n" if stop_reason else "") + content)
+            return 3 if stop_reason else 0
 
+        if stop_reason:
+            event("wrap_up_rejected", reason="provider_requested_disabled_tools")
+            return 3
+
+        warn_stall = False
         for tool_call in tool_calls:
+            if time.monotonic() - started >= max_time:
+                fail("delegate exceeded max time", 124)
+            if not isinstance(tool_call, dict):
+                fail("malformed provider tool call", 1)
             call_id = tool_call.get("id", "missing-call-id")
             function = tool_call.get("function") or {}
             name = function.get("name", "")
             raw_arguments = function.get("arguments", "{}")
+            tool_started = time.monotonic()
             try:
                 arguments = (
                     raw_arguments if isinstance(raw_arguments, dict) else json.loads(raw_arguments)
                 )
                 if not isinstance(arguments, dict):
                     raise ValueError("arguments must be an object")
-                result = tools.execute(name, arguments)
+                checkpoint("tool_pending")
+                event("tool_start", tool=name if name in allowed_names else "unknown")
+                result = (tools.execute(name, arguments) if not stop_reason else
+                          json.dumps({"ok": False, "error": "tools stopped; report required"}))
             except (json.JSONDecodeError, ValueError) as exc:
                 result = json.dumps({"ok": False, "error": f"invalid tool call: {exc}"})
             messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+            checkpoint("tool_completed")
+            ok = json.loads(result).get("ok", False)
+            event("tool_end", tool=name if name in allowed_names else "unknown", ok=ok,
+                  duration_seconds=round(time.monotonic() - tool_started, 3))
+            # Compare both arguments and results: changed evidence is progress.
+            fingerprint = hashlib.sha256(json.dumps([name, raw_arguments, result], sort_keys=True).encode()).hexdigest()
+            repeated[fingerprint] = repeated.get(fingerprint, 0) + 1
+            error_streak = 0 if ok else error_streak + 1
+            if repeated[fingerprint] == 2 or error_streak == 2:
+                warn_stall = True
+                event("stall_warning")
+            if repeated[fingerprint] >= 3 or error_streak >= 3:
+                stop_reason = "stalled"
+                event("stall_detected")
+        if warn_stall:
+            messages.append({"role": "user", "content":
+                "Repeated tool results or errors detected. Change approach or return your partial report."})
 
     fail(f"delegate exceeded maximum of {max_steps} model steps", 124)
 

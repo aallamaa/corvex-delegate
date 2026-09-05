@@ -1,6 +1,6 @@
 # Provider setup
 
-Resolve `<skill-dir>` from the installed `SKILL.md`. The CLI is `python3 <skill-dir>/scripts/corvex-delegate`.
+Resolve `<skill-dir>` from the installed `SKILL.md`. The CLI is `python3 <skill-dir>/scripts/corvee`.
 
 ## Configure
 
@@ -8,14 +8,14 @@ Run `configure` locally to confirm the endpoint and enter the key with hidden in
 
 The wizard fetches the public catalog, optionally selects an exact model, and makes a one-token Chat Completions request to authenticate. Provider charges may apply. Validation must succeed before saving settings. `check` repeats credential/inference validation; `models` only discovers availability.
 
-Settings and credentials are separate files under `${CODEX_HOME:-~/.codex}/corvex-delegate/`, both mode 0600. Settings contain `version`, `base_url`, `model`, `api_key_env`, `credentials_file`, and `default_complexity`. The credential file contains only `api_key`.
+Settings and credentials are separate files under `${CODEX_HOME:-~/.codex}/corvee/`, both mode 0600. Settings contain `version`, `base_url`, `model`, `api_key_env`, `credentials_file`, and `default_complexity`. The credential file contains only `api_key`.
 
 ## Models
 
 - `models [PATTERN]`: print exact live model IDs, optionally filtered.
 - `select` or `show`: show current non-secret settings.
 - `select MODEL_ID`: validate the ID against the catalog and save it.
-- `select auto`: clear the default; do not automatically select another model.
+- `select auto`: clear the default locally without network access or credentials; do not automatically select another model.
 
 Mission model precedence: `--model`, project `--model-config DELEGATE.json`, `CORVEX_MODEL`/dotenv, user config. `DELEGATE.json` contains only `{"model": "exact-model-id"}`.
 

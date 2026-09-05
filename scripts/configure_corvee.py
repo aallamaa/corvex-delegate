@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure, validate, and select models for corvex-delegate."""
+"""Configure, validate, and select models for corvee."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sys
 
-from corvex_delegate_config import (
+from corvee_config import (
     ConfigError,
     DEFAULT_API_KEY_ENV,
     DEFAULT_BASE_URL,
@@ -39,9 +39,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--config", type=Path, default=default_config_path(codex_home))
     result.add_argument("--codex-config", type=Path, default=codex_home / "config.toml")
     result.add_argument(
-        "--agent-file", type=Path, default=codex_home / "agents" / "corvex_delegate.toml"
+        "--agent-file", type=Path, default=codex_home / "agents" / "corvee.toml"
     )
-    result.add_argument("--timeout", type=int, default=30)
+    result.add_argument("--timeout", type=int, default=600,
+                        help="Request timeout in seconds (default: 600)")
     commands = result.add_subparsers(dest="command", required=True)
 
     configure = commands.add_parser("configure", help="validate and save provider settings")
@@ -94,7 +95,7 @@ def configure(args: argparse.Namespace) -> int:
         else:
             raise ConfigError("answer must be yes or no")
 
-    api_key_env = args.api_key_env or DEFAULT_API_KEY_ENV
+    api_key_env = args.api_key_env or current.get("api_key_env") or DEFAULT_API_KEY_ENV
     api_key = os.environ.get(api_key_env, "")
     if args.api_key_env:
         if not api_key:
@@ -128,7 +129,10 @@ def configure(args: argparse.Namespace) -> int:
 
     print("Validating the key with a one-token inference request (provider charges may apply).")
     verify_credential(base_url, api_key, selected or models[0], args.timeout)
-    write_configuration(args.config, base_url=base_url, api_key=api_key, model=selected)
+    write_configuration(args.config, base_url=base_url, api_key=api_key, model=selected,
+                        api_key_env=api_key_env,
+                        credentials_file=current.get("credentials_file") or "credentials.toml",
+                        default_complexity=current.get("default_complexity") or "medium")
     print(f"Corvex connection verified; configuration saved to {args.config}")
     print(f"Default model: {selected or 'not selected'}")
     return 0
@@ -162,6 +166,10 @@ def main() -> int:
         if args.command == "agent-status":
             print(native_agent_status(args.codex_config, args.agent_file))
             return 0
+        if args.command == "select" and args.model == "auto":
+            update_selected_model(args.config, None)
+            print("Cleared the default Corvex model")
+            return 0
         config, base_url, models = checked_settings(args)
         if args.command == "check":
             selected = config.get("model")
@@ -182,7 +190,8 @@ def main() -> int:
             if model not in models:
                 raise ConfigError(f"model is not in the live catalog: {model}")
             api_key = resolve_api_key(config, args.config)
-            probe_responses_api(base_url, api_key, str(model), args.timeout)
+            probe_responses_api(base_url, api_key, str(model), args.timeout,
+                                reasoning_effort=getattr(args, "reasoning_effort", "medium"))
             print(f"Corvex Responses API verified for {model}")
             if args.command == "check-responses":
                 return 0
@@ -198,13 +207,9 @@ def main() -> int:
             )
             print(f"Installed native Corvex provider in {args.codex_config}")
             print(f"Installed native custom agent in {args.agent_file}")
-            print("Restart Codex so it discovers the corvex_delegate agent.")
+            print("Restart Codex so it discovers the corvee agent.")
             return 0
         if args.command == "select":
-            if args.model == "auto":
-                update_selected_model(args.config, None)
-                print("Cleared the default Corvex model")
-                return 0
             if args.model not in models:
                 raise ConfigError(f"model is not in the live catalog: {args.model}")
             update_selected_model(args.config, args.model)

@@ -8,11 +8,11 @@ from pathlib import Path
 import stat
 import tomllib
 
-from corvex_delegate_config import ConfigError, atomic_write
+from corvee_config import ConfigError, atomic_write
 
 
-PROVIDER_BEGIN = "# BEGIN corvex-delegate managed provider"
-PROVIDER_END = "# END corvex-delegate managed provider"
+PROVIDER_BEGIN = "# BEGIN corvee managed provider"
+PROVIDER_END = "# END corvee managed provider"
 
 
 def _provider_block(base_url: str, credential_helper: Path, config_path: Path) -> str:
@@ -49,7 +49,7 @@ def _provider_block(base_url: str, credential_helper: Path, config_path: Path) -
 def _agent_config(model: str, reasoning_effort: str) -> str:
     return "\n".join(
         [
-            'name = "corvex_delegate"',
+            'name = "corvee"',
             'description = "Bounded Corvex implementation and repository-analysis delegate."',
             f"model = {json.dumps(model)}",
             'model_provider = "corvex"',
@@ -84,7 +84,7 @@ def install_native_agent(
     begin_count = existing.count(PROVIDER_BEGIN)
     end_count = existing.count(PROVIDER_END)
     if begin_count != end_count or begin_count > 1:
-        raise ConfigError("Codex config has malformed corvex-delegate provider markers")
+        raise ConfigError("Codex config has malformed corvee provider markers")
     block = _provider_block(base_url, credential_helper, delegate_config)
     if begin_count == 1:
         start = existing.index(PROVIDER_BEGIN)

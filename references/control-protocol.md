@@ -3,7 +3,7 @@
 Use a durable control directory in the target repository:
 
 ```text
-.codex/corvex-delegate/
+.codex/corvee/
 |-- TARGET.md
 |-- STATE.md
 |-- DELEGATE.json
@@ -55,15 +55,15 @@ Maximum iterations and optional time or cost boundary.
 Show current non-secret configuration and validate it, or configure Corvex from a safe credential source. Never request a key in chat. Use:
 
 ```bash
-python3 <skill-dir>/scripts/corvex-delegate show
-python3 <skill-dir>/scripts/corvex-delegate check
+python3 <skill-dir>/scripts/corvee show
+python3 <skill-dir>/scripts/corvee check
 ```
 
-If `CORVEX_API_KEY` or an explicitly identified dotenv file is available, run `scripts/corvex-delegate configure` non-interactively. Otherwise direct the user to the local hidden-input wizard. Configuration is complete only after authenticated inference succeeds; the public catalog alone does not validate a key.
+If `CORVEX_API_KEY` or an explicitly identified dotenv file is available, run `scripts/corvee configure` non-interactively. Otherwise direct the user to the local hidden-input wizard. Configuration is complete only after authenticated inference succeeds; the public catalog alone does not validate a key.
 
 ### `check`
 
-Run `scripts/corvex-delegate check`. This makes a tiny billable inference request using the saved model, or the first catalog model solely for validation if no default is set. It does not change the model selection.
+Run `scripts/corvee check`. This makes a tiny billable inference request using the saved model, or the first catalog model solely for validation if no default is set. It does not change the model selection.
 
 ### `target GOAL`
 
@@ -100,6 +100,12 @@ Execute exactly one controlled iteration:
 
 Use a fresh direct-runner context for each mission. A failed or timed-out run may have left partial edits; inspect before retrying. Capture the report and exit status in `reports/`. Do not include credential values or environment dumps.
 
+The runner now creates a private per-run artifact directory automatically; use `--run-dir` to name a new directory explicitly. Read metadata in `events.jsonl` and `status.json` first. `checkpoint.json` preserves conversation/tool results and may contain private repository content. Inspect it locally as needed; do not paste it wholesale into chat or a new mission. Never replay a `tool_pending` operation without verifying whether its effects already occurred.
+
+Request timeouts default to 600 seconds; retain that allowance for slow models unless the user requests less. The total run budget still wins. A transient request can retry once (up to two with `--request-retries 2`), with possible duplicate provider charges, but completed local tools are not rerun. Do not restart an entire mission merely because one inference request timed out.
+
+The final step/time reserve requests a tools-disabled report. Repeated identical results or consecutive tool errors trigger early wrap-up. Exit `3` is an incomplete report, `75` is exhausted transient retries, and `124` is budget exhaustion. None closes an acceptance gate. Inspect diagnostics before increasing limits or changing model/scope.
+
 ### `loop [CONDITION] [--max-iterations N] [--max-time DURATION]`
 
 Repeat `run` until the explicit condition is independently verified. If no condition is supplied, use all acceptance gates in `TARGET.md`.
@@ -128,11 +134,11 @@ Report the outcome, gate checklist, latest verified evidence, current blocker, b
 
 ### `models [PATTERN]`
 
-List provider model IDs directly using `scripts/corvex-delegate models [PATTERN]`. This is discovery only; do not infer quality from a model name.
+List provider model IDs directly using `scripts/corvee models [PATTERN]`. This is discovery only; do not infer quality from a model name.
 
 ### `select [MODEL_ID|auto]`
 
-With no argument, use `scripts/corvex-delegate select`. With an exact ID, run `scripts/corvex-delegate select MODEL_ID`; it fetches the catalog, requires an exact match, and saves the selection. With `auto`, clear the user default; a mission still needs a model through a command argument, project file, or environment override.
+With no argument, use `scripts/corvee select`. With an exact ID, run `scripts/corvee select MODEL_ID`; it fetches the catalog, requires an exact match, and saves the selection. With `auto`, clear the user default; a mission still needs a model through a command argument, project file, or environment override.
 
 Do not silently fuzzy-select or substitute a model. A project `DELEGATE.json` overrides the user default through `--model-config`; an explicit `--model` overrides both without changing stored selections.
 

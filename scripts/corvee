@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Command-line entry point for Corvex Delegate (Python 3.11+)."""
+"""Command-line entry point for Corvée (Python 3.11+)."""
 
 from __future__ import annotations
 
@@ -9,20 +9,20 @@ import sys
 def main() -> int:
     commands = {"configure", "models", "select", "show", "check"}
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
-        print("Usage: corvex-delegate COMMAND [OPTIONS]")
+        print("Usage: corvee COMMAND [OPTIONS]")
         print("Commands: configure, models [PATTERN], select MODEL, show, check, run")
-        print("For command help: corvex-delegate COMMAND --help")
+        print("For command help: corvee COMMAND --help")
         print("target, analyze, refine, loop, audit and status are Codex skill instructions;")
-        print("invoke them in chat as: $corvex-delegate loop")
+        print("invoke them in chat as: $corvee loop")
         return 0
     command, *arguments = sys.argv[1:]
     if command == "run":
-        from corvex_delegate import main as run
+        from corvee import main as run
 
         sys.argv = [sys.argv[0], *arguments]
         return run()
     if command in commands:
-        from configure_delegate import main as configure
+        from configure_corvee import main as configure
 
         # Accept shared config options after the subcommand as users expect.
         shared, rest = [], []
