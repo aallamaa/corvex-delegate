@@ -7,6 +7,14 @@ description: Delegate bounded repository work directly to Corvex models while Co
 
 Keep architecture, targets, sequencing, review, and acceptance in Codex. Send bounded missions to Corvex through the bundled runner. The primary Codex model is not changed.
 
+## When to delegate
+
+The skill's value is **cheap tokens for bulk reading, expensive planner tokens reserved for thinking.** Corvex models cost a fraction of flagship Codex models per token, so moving large-scale code reading and mechanical editing to the delegate saves money and conserves the planner's context window.
+
+Delegate when the direct work would consume roughly 40K or more tokens of reading — medium-to-large missions on unfamiliar or large codebases. The planner overhead (mission prep, review, gate verification) is roughly constant regardless of mission size, while the delegate's work scales with the codebase, so the larger the mission the stronger the savings.
+
+Do small tasks directly. A mission where the delegate spends more tokens exploring the codebase than the planner would spend doing the work itself is a net loss. If the planner already has the context and the task is a few reads and one edit, do it yourself.
+
 ## Instructions
 
 The word after `$corvee` is a skill instruction, not a registered slash command. Six of them run the bundled CLI; the rest are planning steps you carry out yourself, with no script behind them.
@@ -60,6 +68,8 @@ python3 <skill-dir>/scripts/corvee run \
 ```
 
 Omit `--write` for analysis and review; enable it only for authorized edits. The delegate reads, searches and edits; it cannot execute anything. File tools confine paths to the repository but do not guarantee that repository contents are secret-free. Use a sanitized checkout when needed.
+
+Every tool result the delegate reads is persisted verbatim to `checkpoint.json` in the run directory, which embeds repository content. The runner redacts only the API key; any other secret the delegate reads — a `.env`, a private key, another tool's credentials — is written to disk and travels with the workspace. A sanitized checkout is the only complete mitigation for secret-bearing repositories.
 
 When the delegate needs something only a command can answer, it calls `request_command` and the run stops with exit `65`. Nothing has been executed. `report.md` names the command and the reason, and `status.json` repeats them under `command_request`. You decide whether to run it — this is the point where the user's own approval and sandbox apply, and refusing is a legitimate answer. To continue, capture stdout, stderr and the exit code into a file and resume:
 

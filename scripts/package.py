@@ -21,6 +21,8 @@ EXCLUDED_FILES = (
     "pyproject.toml",
     ".gitignore",
     ".github/workflows/ci.yml",
+    "AUDIT_TODO.md",
+    "COST_ASSESSMENT.md",
 )
 
 
