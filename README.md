@@ -178,6 +178,6 @@ python3 scripts/package.py
 
 CI runs the same checks on Linux and macOS across Python 3.11-3.13. Tests use a mock provider and no real key. Live checks are opt-in. Packaging creates a filtered archive and SHA-256 checksum in `dist/`.
 
-This is an independent community skill, not an official OpenAI or Corvex product. Corvex is a registered trademark of [Corvex AI](https://www.corvex.ai/).
+This is an independent community skill, not an official OpenAI or Corvex product. It was developed and tested against [Corvex Token Factory](https://api.tokenfactory.corvex.cloud/v1) during its alpha program. Corvex is a registered trademark of [Corvex AI](https://www.corvex.ai/).
 
 Licensed under the [MIT License](LICENSE).
