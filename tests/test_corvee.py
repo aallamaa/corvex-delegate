@@ -2425,6 +2425,16 @@ class DelegationEconomicsTest(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.run_dir = Path(self.directory.name) / "run"
 
+        # Integration-test the fixed helper against real temporary Git trees,
+        # substituting only the outer sandbox transport (CI needs no Codex).
+        def transport(codex_bin, command, cwd, timeout, *, read_only=False):
+            self.assertTrue(read_only)
+            return subprocess.run(command, cwd=cwd, capture_output=True, text=True,
+                                  timeout=timeout)
+        mocked = patch("corvee_executor.execute", side_effect=transport)
+        mocked.start()
+        self.addCleanup(mocked.stop)
+
     def test_status_records_only_what_the_runner_can_observe(self) -> None:
         journal = corvee.RunJournal(self.run_dir, "secret")
         for _ in range(30):
@@ -2992,3 +3002,74 @@ class EffortForwardingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GitExecutorRoutingTest(unittest.TestCase):
+    def test_tools_and_accounting_use_read_only_executor(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False, codex_bin="/chosen/codex")
+        def answer(binary, command, cwd, timeout, *, read_only=False):
+            self.assertEqual(binary, "/chosen/codex")
+            self.assertTrue(read_only)
+            self.assertEqual(command[1], "-I")
+            return subprocess.CompletedProcess(command, 0, "123" if command[3] == "measure" else "evidence", "")
+        with patch("corvee_executor.execute", side_effect=answer) as execute:
+            self.assertEqual(tools.tool_git_status(), "evidence")
+            self.assertEqual(tools.tool_git_diff("README.md"), "evidence")
+            self.assertEqual(corvee.measure_diff(Path.cwd(), codex_bin="/chosen/codex"), 123)
+        self.assertEqual(execute.call_count, 3)
+
+    def test_executor_failure_never_falls_back_to_local_git(self):
+        from corvee_executor import ExecutorError
+        with patch("corvee_executor.execute", side_effect=ExecutorError("rejected")), patch.object(corvee, "run_process") as local:
+            with self.assertRaises(ExecutorError):
+                corvee.RepositoryTools(Path.cwd(), False).tool_git_status()
+            self.assertIsNone(corvee.measure_diff(Path.cwd()))
+            local.assert_not_called()
+
+    def test_outside_path_rejected_before_execution(self):
+        with tempfile.TemporaryDirectory() as d, patch("corvee_executor.execute") as execute:
+            with self.assertRaises(ValueError):
+                corvee.RepositoryTools(Path(d), False).tool_git_diff("../escape")
+            execute.assert_not_called()
+
+class GitHelperBoundaryTest(unittest.TestCase):
+    def test_configured_external_diff_and_fsmonitor_are_not_run(self):
+        if shutil.which("git") is None:
+            self.skipTest("git unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "tracked").write_text("before\n")
+            subprocess.run(["git", "add", "tracked"], cwd=root, check=True)
+            subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=t@e", "commit", "-qm", "initial"], cwd=root, check=True)
+            hook = root / "helper"
+            hook.write_text("#!/bin/sh\ntouch helper-ran\n")
+            hook.chmod(0o700)
+            for key in ("diff.external", "core.fsmonitor"):
+                subprocess.run(["git", "config", key, str(hook)], cwd=root, check=True)
+            (root / "tracked").write_text("after\n")
+            helper = SKILL_ROOT / "scripts/corvee_git.py"
+            for operation in ("status", "diff", "measure"):
+                result = subprocess.run([sys.executable, "-I", str(helper), operation], cwd=root, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((root / "helper-ran").exists())
+            self.assertGreater(int(result.stdout), 0)
+
+    def test_large_diff_accounting_is_not_transport_truncated(self):
+        if shutil.which("git") is None:
+            self.skipTest("git unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            tracked = root / "tracked"
+            tracked.write_text("before\n")
+            subprocess.run(["git", "add", "tracked"], cwd=root, check=True)
+            subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=t@e", "commit", "-qm", "initial"], cwd=root, check=True)
+            tracked.write_text("changed\n" * 10000)
+            (root / "new\nfile").write_bytes(b'x' * 500)
+            helper = SKILL_ROOT / "scripts/corvee_git.py"
+            measured = subprocess.run([sys.executable, "-I", str(helper), "measure"], cwd=root, capture_output=True, text=True, check=True)
+            self.assertGreater(int(measured.stdout), 80000)
+            diff = subprocess.run([sys.executable, "-I", str(helper), "diff"], cwd=root, capture_output=True, text=True)
+            self.assertNotEqual(diff.returncode, 0)
+            self.assertIn("exceeded output limit", diff.stderr)

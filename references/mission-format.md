@@ -1,5 +1,9 @@
 # Delegate mission format
 
+Choose the lane with [work-routing.md](work-routing.md). The template below is
+for `run`; `job` supplies its own edit/review schemas and runs the declared gate
+automatically (see [job-workflow.md](job-workflow.md)).
+
 Prefer the user's existing task over rewriting it. Add only what the worker
 cannot infer safely. A routine mission is usually 100–200 words:
 
@@ -61,4 +65,8 @@ clean audit is not a passing gate.
 
 Keep the mission within the user's authorized scope. State known pre-existing changes so the delegate does not overwrite or misattribute them. For read-only missions, say explicitly that no repository edits are allowed.
 
-Delegate verification is advisory. The primary Codex agent reruns the gate command before closing a gate, and reads the change to the extent the gate does not cover it.
+Delegate verification is advisory. For `run`, the parent executes the gate
+before acceptance and reviews requirements it does not cover. For `job`, use the
+controller-executed evidence for the unchanged candidate; rerun when evidence is
+stale, incomplete, contradictory, or the user requires it. A model's claim of
+success never substitutes for an actual check.

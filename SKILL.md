@@ -10,11 +10,23 @@ acceptance in Codex. Let the cheap worker investigate implementation details,
 edit, and repair its own work. Avoid paying the planner to solve a task before
 handing it off, then paying it again to rewrite the worker's solution.
 
+## Choose work before paying for a handoff
+
+Use direct work for small known fixes or an already-available deterministic
+solution. Favor Corvée for substantial related work under one settled contract
+and strong executable checks. Unknown entry points call for bounded cheap
+discovery; unresolved semantics stay with Codex until acceptance is clear.
+Reuse the task and current session instead of adding a planning call. Long output
+is not value if Codex must reread and solve it to accept it.
+Read [work-routing.md](references/work-routing.md) when selecting a package,
+budgeting a handoff, or deciding how much final review is necessary.
+
 ## Experimental lane for bounded work: autonomous cheap execution
 
 Use `corvee job` for a requested bounded outsourcing trial with known source
-files and an authorized executable acceptance gate. Its first integrated live
-measurement failed to complete; do not represent it as a proven cheaper default.
+files and an authorized executable acceptance gate. Implementation trials failed acceptance; a later synthetic migration saved
+cost using a different script/probe harness. This controller is not a proven
+cheaper default.
 Read [job-workflow.md](references/job-workflow.md) for the command and boundaries.
 Declare the existing UTF-8 source files and immutable gate fixtures. This lane
 sends complete source packets and applies exact replacements, with no browsing
@@ -49,8 +61,10 @@ repairs involving correctness or compatibility. Earlier 8K–16K capped failures
 justify revisiting output/time allowances, not disabling reasoning globally.
 Use instant mode for mechanical edits or an explicitly labeled comparison.
 For thinking jobs, set an explicit allowance such as 32,768 output tokens and
-300 seconds per call, bounded repairs, and stop on exhaustion. These are starting
-budgets, not a validated guarantee or permission to keep retrying.
+600 seconds per call, bounded repairs, and stop on exhaustion. These are starting
+budgets, not a validated guarantee or permission to keep retrying. The adversarial
+trial exhausted all 32K tokens in reasoning with no deliverable: narrow subsequent
+authorized work rather than automatically increasing the allowance.
 
 For a declared gate, `job --executor codex --codex-bin /path/to/codex` uses
 Codex app-server `command/exec` with workspace-write and network disabled.
@@ -120,8 +134,8 @@ acceptance criteria. Never weaken a gate to manufacture success.
 
 ## Evidence, budgets, and boundaries
 
-Read `status.json` for exit status, cumulative provider usage, tool counts and
-bytes. Keep verbose event streams out of planner context. Economics do not
+For `run`, read `status.json` for exit status, cumulative provider usage, tool
+counts and bytes. For `job`, use the compact CLI result and its `result.json`. Keep verbose event streams out of planner context. Economics do not
 include planner tokens. `--complexity` gives low 16 steps/20 minutes, medium
 32/60, high 48/120; explicit step/time overrides win. Requests default to 600
 seconds within the run deadline. Repairs must fit the remaining overall budget.
@@ -130,9 +144,12 @@ File tools confine paths to the repository. Writes refuse `.git` components,
 `.codex/corvee/reports`, and the active custom run directory after resolution.
 New artifact paths must resolve inside the repository; existing ignore rules
 are preserved when artifact exclusions are appended. Read-only mode disables
-file edits. This is not an OS sandbox: the unresolved Git-helper issue means
-Git inspection can execute existing configured helpers. Use a sanitized trusted
-checkout; do not claim a complete execution boundary pending that fix.
+file edits. `run` Git status/diff and automatic change-size accounting use Codex
+command/exec with a read-only sandbox and no model turn. Set `--codex-bin` when
+needed and repeat it on resume; no direct execution fallback exists. Tool errors
+or null accounting mean unavailable evidence. Git inspection disables configured
+external diff/text conversion/fsmonitor/hooks and ignores submodules. Other file
+tools remain outside that sandbox; use a sanitized trusted checkout.
 
 Mission content and tool results go to the provider. Private checkpoints embed
 repository content and provider reasoning fields. Only the configured API key

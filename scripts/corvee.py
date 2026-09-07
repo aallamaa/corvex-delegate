@@ -642,9 +642,22 @@ class ApiClient:
         return request_json(req, timeout=self.timeout, deadline=False)
 
 
+def git_inspection(root: Path, operation: str, path: str | None = None, *,
+                   codex_bin: str = "codex") -> subprocess.CompletedProcess:
+    from corvee_executor import execute
+
+    command = [sys.executable, "-I", str(Path(__file__).with_name("corvee_git.py")), operation]
+    if path is not None:
+        command.append(path)
+    return execute(codex_bin, command, root, 90 if operation == "measure" else 30,
+                   read_only=True)
+
+
 class RepositoryTools:
-    def __init__(self, root: Path, write: bool, *, run_dir: Path | None = None) -> None:
+    def __init__(self, root: Path, write: bool, *, run_dir: Path | None = None,
+                 codex_bin: str = "codex") -> None:
         self.root = root.resolve()
+        self.codex_bin = codex_bin
         self.run_dir = run_dir.resolve() if run_dir is not None else None
         self.write = write
         # Set by request_command; run_steps stops the run when it appears.
@@ -966,14 +979,14 @@ class RepositoryTools:
         return body
 
     def tool_git_status(self) -> str:
-        return self.fixed_command(["git", "status", "--short", "--branch"])
+        return self.git_command("status")
 
     def tool_git_diff(self, path: str | None = None) -> str:
-        command = ["git", "diff", "--"]
+        relative = None
         if path:
             target = self.safe_path(path, allow_missing=True)
-            command.append(str(target.relative_to(self.root)))
-        return self.fixed_command(command)
+            relative = str(target.relative_to(self.root))
+        return self.git_command("diff", relative)
 
     def tool_replace_text(
         self, path: str, old_text: str, new_text: str, expected_occurrences: int = 1
@@ -1032,10 +1045,10 @@ class RepositoryTools:
             "this command and will resume you with its output. Do not call any further tools."
         )
 
-    def fixed_command(self, argv: list[str]) -> str:
-        result = run_process(argv, cwd=self.root, timeout=30)
+    def git_command(self, operation: str, path: str | None = None) -> str:
+        result = git_inspection(self.root, operation, path, codex_bin=self.codex_bin)
         if result.returncode != 0:
-            raise ValueError(result.stderr.strip() or f"command failed: {' '.join(argv)}")
+            raise ValueError(result.stderr.strip() or "Git inspection failed")
         return result.stdout
 
 
@@ -1057,6 +1070,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mission", type=Path)
     parser.add_argument("--cwd", type=Path, default=Path.cwd())
+    parser.add_argument("--codex-bin", default="codex",
+                        help="Codex executable for sandboxed Git inspection; no local fallback")
     parser.add_argument("--model")
     parser.add_argument("--model-config", type=Path)
     parser.add_argument("--base-url")
@@ -1340,7 +1355,7 @@ def main() -> int:
             {"role": "system", "content": system},
             {"role": "user", "content": f"Repository root: {root}\n\nMission:\n{mission}"},
         ]
-    tools = RepositoryTools(root, args.write, run_dir=run_dir)
+    tools = RepositoryTools(root, args.write, run_dir=run_dir, codex_bin=args.codex_bin)
 
     run_description = {
         "base_url": base_url,
@@ -1402,7 +1417,7 @@ def main() -> int:
             fail(f"cannot open private run directory: {exc}")
         fail(f"cannot create private run directory: {exc}")
     journal.verbose = args.verbose
-    journal.diff_measurer = (lambda: measure_diff(root)) if args.write else (lambda: 0)
+    journal.diff_measurer = (lambda: measure_diff(root, codex_bin=args.codex_bin)) if args.write else (lambda: 0)
     print(f"Run artifacts: {directory}", file=sys.stderr, flush=True)
     journal.run_context = run_description["run_context"]
     if run_effort is not None:
@@ -1447,40 +1462,20 @@ def main() -> int:
     return code
 
 
-def measure_diff(root: Path) -> int | None:
-    """Size the change this run left in the repository.
+def measure_diff(root: Path, *, codex_bin: str = "codex") -> int | None:
+    """Measure staged/unstaged diff plus untracked bytes inside the sandbox.
 
-    Measures the tree against HEAD, so staged work counts, plus the size of
-    untracked files, which no git diff reports. None means the size is unknown
-    (no git, not a repository, git failed) and is reported as such rather than
-    as zero.
+    Missing executor, sandbox rejection or incomplete accounting means unknown.
+    No direct Git fallback is permitted.
     """
-    git = shutil.which("git")
-    if git is None:
-        return None
+    from corvee_executor import ExecutorError
+
     try:
-        # Against HEAD, so staged work counts; a repository with no commits
-        # yet has no HEAD, so fall back to the working-tree diff.
-        result = run_process([git, "diff", "HEAD"], cwd=root, timeout=30)
-        if result.returncode != 0:
-            result = run_process([git, "diff"], cwd=root, timeout=30)
-        if result.returncode != 0:
-            return None
-        total = len(result.stdout.encode("utf-8"))
-        # Untracked files are invisible to git diff, so a mission that creates
-        # a new module would otherwise measure as no change at all.
-        listed = run_process(
-            [git, "ls-files", "--others", "--exclude-standard"], cwd=root, timeout=30
-        )
-    except (OSError, subprocess.SubprocessError):
+        result = git_inspection(root, "measure", codex_bin=codex_bin)
+        value = int(result.stdout.strip())
+        return value if result.returncode == 0 and value >= 0 else None
+    except (OSError, subprocess.SubprocessError, ExecutorError, ValueError):
         return None
-    if listed.returncode == 0:
-        for name in listed.stdout.splitlines():
-            try:
-                total += (root / name).stat().st_size
-            except OSError:
-                continue
-    return total
 
 
 def prune_tool_history(messages: list[dict[str, Any]],

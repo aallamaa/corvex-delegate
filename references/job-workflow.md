@@ -1,8 +1,10 @@
 # Corvée jobs: Astra sets direction, scripts coordinate execution
 
-Experimental: the first integrated live measurement failed its task; the
-controller passed local tests, but global savings and successful live cheap
-review remain unproven. See [the cost assessment](../COST_ASSESSMENT.md).
+Experimental: implementation trials did not achieve cheaper accepted results.
+The larger queue reached `ready`, but Astra found defects missed by its gate and
+cheap review. A later synthetic migration saved 58% using a different script/probe
+harness; it does not validate this controller unchanged. See
+[the cost assessment](../COST_ASSESSMENT.md) and [work routing](work-routing.md).
 
 Use this lane for bounded work with a clear contract and an existing executable
 acceptance gate. Astra resolves architecture, compatibility requirements and
@@ -25,14 +27,19 @@ python3 scripts/corvee job \
   --gate-json '["python3", "gate.py"]' \
   --scope-file src/parser.py --protected-file gate.py \
   --max-repairs 1 --max-input-bytes 60000 \
-  --max-output-tokens 32768 --max-time 300
+  --max-output-tokens 32768 --max-time 600
 ```
 
 For substantive implementation/review, prefer thinking enabled and an explicit
 output/time budget. The example budgets are a starting point, not a proven
 successful configuration. Instant mode remains available for mechanical edits.
 The CLI does not infer a thinking budget: explicitly pass these limits; its
-older 8,192-token/120-second defaults can truncate reasoning workloads.
+8,192-token/120-second defaults can truncate reasoning workloads. Even 32,768
+tokens were exhausted entirely in reasoning in the adversarial experiment.
+`--max-time` accepts integer seconds per provider call, not a whole-job deadline.
+There can be up to `2 * (max_repairs + 1)` calls, plus gate execution. Select the
+repair and per-call budgets together; do not assume this example caps a job at
+ten minutes.
 
 To use Codex's sandbox for the gate, add:
 
@@ -56,8 +63,8 @@ they can automate lifecycle actions but are not the worker's reasoning loop.
 List immutable test fixtures with repeated `--protected-file`. The controller
 checks them before executing the gate and after workers run. Protection is a
 change detector, not an OS boundary; imported code and dependencies remain
-executable. This job command performs no Git inspection. The existing `run` command still
-has its documented Git-helper limitation. Never use an untrusted repository
+executable. This job command performs no Git inspection. The `run` command now routes its fixed Git inspection and accounting through
+the read-only Codex executor, without a local fallback. Never use an untrusted repository
 as an execution sandbox.
 
 List the exact existing UTF-8 files to edit with repeated `--scope-file`. The

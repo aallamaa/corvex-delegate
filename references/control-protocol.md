@@ -124,8 +124,11 @@ The gate in step 3 is authoritative. Limit routine repairs to two attempts and
 remaining iteration/time/spend budgets; do not turn an output cap into an
 unbounded retry loop. Prefer worker repair to an automatic expensive rewrite.
 
-Running the parent gate is not optional and is not delegable: the delegate's own claim that a
-check passed is evidence, not proof. Gate coverage informs the depth of final review; it does not eliminate it.
+For this `run` loop, the parent must execute the gate; the delegate's own claim
+is not verification. In the bounded `job` lane, the controller executes the
+parent-authorized gate without an Astra turn. Use that evidence for the unchanged
+candidate rather than rerunning solely for orchestration. Gate coverage informs
+review of remaining requirements; it does not establish untested correctness.
 
 Use a fresh direct-runner context for each mission. A failed or timed-out run may have left partial edits; inspect before retrying. Capture the report and exit status in `reports/`. Do not include credential values or environment dumps.
 

@@ -123,9 +123,14 @@ updates, and Git-verified exclusions for custom directory names.
   back to status for legacy checkpoints. Refuse malformed counters. Recompute
   report/diff snapshots instead of accumulating them. Regression tests cover
   repeated resumes, interrupted resumes, legacy fallback, and invalid counters.
-- [ ] **P1 — Git inspection executes configured helpers.** Read-only git diff
-  and automatic diff measurement both executed a configured external helper
-  in the audit reproduction. Remediation remains pending.
+- [x] **P1 — Unconfined Git inspection executes configured helpers.** Replaced
+  direct status/diff and automatic measurement subprocesses with fixed operations
+  through Codex command/exec in a read-only sandbox; no local fallback. Disable
+  external diff/textconv/fsmonitor/hooks, clear inherited Git settings, and ignore
+  submodule inspection. Regression tests cover external helper suppression,
+  accounting, executor rejection, and protocol without model turns. A live check
+  verified status/diff/accounting and rejection of repository writes. This closes
+  the unconfined inspection path, not a claim that all repository code is safe.
 
 ## Savings-claim review — 2026-09-07
 
@@ -184,7 +189,8 @@ updates, and Git-verified exclusions for custom directory names.
   repaired a further over-maximum edge case. Combined worker cost $0.07695.
 - [x] 174 native tests pass; Ruff clean. Full revised planner cost remains
   unmetered; worker-only costs are not presented as end-to-end savings.
-- [ ] P1 Git-helper execution remains unresolved; no new command execution
+- [x] P1 was unresolved at this earlier checkpoint; fixed by the later read-only
+  executor change above. No new command execution
   capability was introduced as part of this work.
 
 

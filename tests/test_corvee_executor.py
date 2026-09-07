@@ -9,7 +9,7 @@ from corvee_executor import ExecutorError, execute
 
 
 class ExecutorTest(unittest.TestCase):
-    def test_protocol_has_no_model_turn_and_preserves_command_result(self):
+    def check_protocol(self, read_only=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             server = root / "fake-codex"
@@ -25,14 +25,21 @@ for line in sys.stdin:
         print(json.dumps({'id':msg['id'],'result':{'exitCode':7,'stdout':'out','stderr':'err'}}),flush=True)
 ''')
             server.chmod(0o700)
-            result = execute(str(server), ["trusted-gate", "argument with spaces"], root, 2)
+            result = execute(str(server), ["trusted-gate", "argument with spaces"], root, 2, read_only=read_only)
             self.assertEqual((result.returncode, result.stdout, result.stderr), (7, "out", "err"))
             requests = json.loads((root / "requests.json").read_text())
             self.assertEqual([r["method"] for r in requests], ["initialize", "initialized", "command/exec"])
             params = requests[-1]["params"]
             self.assertEqual(params["command"], ["trusted-gate", "argument with spaces"])
-            self.assertEqual(params["sandboxPolicy"], {"type": "workspaceWrite", "networkAccess": False})
+            self.assertEqual(params["sandboxPolicy"], {"type": "readOnly"} if read_only else
+                             {"type": "workspaceWrite", "networkAccess": False})
             self.assertEqual(params["outputBytesCap"], 32768)
+
+    def test_protocol_has_no_model_turn_and_preserves_command_result(self):
+        self.check_protocol()
+
+    def test_read_only_inspection_has_no_model_turn(self):
+        self.check_protocol(read_only=True)
 
     def test_server_rejection_never_returns_success(self):
         with tempfile.TemporaryDirectory() as tmp:

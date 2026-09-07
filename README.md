@@ -95,7 +95,8 @@ from releases. They are development evidence, not a supported benchmark suite.
 
 ## Requirements
 
-Python 3.11+, Git, ripgrep (`rg`) or `grep`, Codex with local skill support, and a Corvex API key. The Python runtime uses only the standard library. Linux and macOS are supported; the runner uses POSIX signals for wall-clock deadlines and does not support Windows.
+Python 3.11+, Git, ripgrep (`rg`) or `grep`, Codex with local skill support and
+`app-server command/exec` for Git inspection, and a Corvex API key. The Python runtime uses only the standard library. Linux and macOS are supported; the runner uses POSIX signals for wall-clock deadlines and does not support Windows.
 
 Search and file listing prefer ripgrep. Both fallbacks skip hidden entries and symlinks, use filename/path globs (the search fallback adds extended regular expressions), and do not interpret `.gitignore`; use a sanitized checkout when ignored files contain private data.
 
@@ -139,9 +140,28 @@ $corvee loop until every gate passes, at most 6 iterations or 120 minutes
 $corvee status
 ```
 
-Other instructions: `check`, `refine`, `run` (one iteration), `audit`, and `cleanup`. These are skill arguments, not slash commands, and any budget written after `loop` is prose the planner interprets rather than parsed flags. `select auto` clears the default rather than choosing a model automatically.
+Other instructions: `check`, `refine`, `run` (one iteration), `job` (bounded automatic execution), `audit`, and `cleanup`. These are skill arguments, not slash commands, and any budget written after `loop` is prose the planner interprets rather than parsed flags. `select auto` clears the default rather than choosing a model automatically.
 
 Codex maintains acceptance criteria, missions, and progress in `.codex/corvee/` in the target repository. A loop ends at independently verified completion or its budget/blocking boundary. Loops run in the active Codex session, not as a background service.
+
+## Choosing cost-effective work
+
+| Work | Preferred route |
+|---|---|
+| Small known fix or an existing script already solves it | Direct work; avoid delegation overhead |
+| Substantial related edits with settled behavior and strong checks | One bounded Corvée job with automatic gate/repair transitions |
+| Unknown entry points | Cheap read-only discovery, then select a bounded package |
+| New semantics or weak acceptance checks | Codex defines the contract and verification before delegating implementation |
+| Adversarial search | A bounded experiment around one invariant and executable reproducers; savings remain unproven |
+
+Reuse the existing task and Codex session for dispatch. Avoid an extra planning
+call when scope and acceptance are already clear. Have the controller execute
+checks and route ordinary failures back to Corvée; send Codex compact evidence
+and unresolved questions. Codex still checks requirements the gate does not cover.
+Building a new acceptance harness is task cost, so delegation may lose if that
+requires solving the problem first. See [work routing](references/work-routing.md)
+for budgeting, stopping rules, and the handoff format. This is routing guidance,
+not an automatic cost optimizer or a new measured savings claim.
 
 ## Keep planner involvement small
 
@@ -152,6 +172,12 @@ and validates replacement edits. It uses fresh repair contexts and no browsing
 tools. Astra handles architecture and escalated decisions, not routine test
 failures. See [the job workflow](references/job-workflow.md) for the command,
 limits, and meaning of `ready`. Jobs do not merge or deploy.
+
+`job` uses file snapshots and Python diffs, so it needs no Git inspection tools.
+With `--executor codex`, its declared gate executes without creating a model
+turn. The `run` command now routes Git status, diff, and change-size accounting through
+the same executor with a read-only sandbox. Corvée reasoning and Codex chat
+overhead still count. See [Git and execution boundaries](references/work-routing.md#git-and-the-command-executor).
 
 For exploration or work outside this bounded lane, `corvee run` remains available.
 Earlier integrated implementation trials did not beat direct Astra on accepted
@@ -181,11 +207,35 @@ python3 scripts/corvee run --mission /path/mission.md --cwd /path/repo --max-tim
 python3 scripts/corvee run --resume /path/repo/.codex/corvee/reports/<run-id> --max-steps 8 --max-time 15m
 ```
 
-Use `COMMAND --help` for options. `--config PATH` selects another settings file. Target planning, audit, and loops are interpreted by Codex; the CLI runs individual missions, not the entire orchestration workflow.
+Use `COMMAND --help` for options. Setup and `run` support `--config PATH` to
+select another settings file; `job` currently uses the default configuration. Target planning, audit, and loops are interpreted by Codex; the CLI runs individual missions, not the entire orchestration workflow.
 
-### Long requests and recovery
+### Sandboxed Git inspection (`run`)
 
-Inference requests default to a **600-second** socket timeout (`run --http-timeout`, or `--timeout` for configuration commands). Every duration option accepts plain seconds or a `30s`/`30m`/`2h` suffix. The runner's total `--max-time` remains a hard wall-clock boundary. Between requests it reserves up to 20% of the run budget for reporting, so a shorter run may cap an individual request below 600 seconds.
+`git_status` and `git_diff` keep their tool names for checkpoint compatibility,
+but execute fixed operations through Codex `command/exec` in a read-only sandbox.
+Automatic `diff_bytes` accounting uses that executor too. No model turn is
+created and no arbitrary shell tool is added. Configure the executable with
+`run --codex-bin /absolute/path/to/codex` when it is not on PATH; repeat the option
+on resume. Executable selection comes from the caller, not saved worker content.
+There is no unsandboxed fallback: unavailable/rejected execution returns a tool
+error, and unavailable accounting is null rather than zero.
+
+Git inspection disables external diff, text conversion, fsmonitor and hooks,
+clears inherited Git settings, and ignores submodule inspection. Accounting counts
+staged/unstaged changes and untracked file sizes inside the sandbox, returning
+only a number. Tool diffs/status above the capture limit return an explicit error;
+narrow the diff path. These measures constrain Git inspection; file tools and
+provider requests are not thereby moved into the Codex sandbox.
+
+### Long requests and recovery (`run`)
+
+Inference requests default to a **600-second** socket timeout (`run --http-timeout`, or `--timeout` for configuration commands). The `run` duration options accept plain seconds or a `30s`/`30m`/`2h` suffix. The `run` command's total `--max-time` remains a hard wall-clock boundary. Between requests it reserves up to 20% of the run budget for reporting, so a shorter run may cap an individual request below 600 seconds.
+
+For `job`, `--max-time` is integer seconds per provider call, not a whole-job
+deadline; `--gate-timeout` is per gate. At most `2 * (max_repairs + 1)` provider
+calls occur. Its compact output points to `result.json`, not `status.json`.
+Input/output/time limits and repair count bound attempts, not dollars.
 
 `status.json` also records what the run cost on the delegate side: `delegate_tool_bytes` and `delegate_tool_calls` (what the delegate read), `mission_bytes`, `report_bytes`, and `diff_bytes` (working tree against `HEAD`, plus untracked files). The runner has no visibility into the planner's own token spend, which happens in another process, so it reports its own side and leaves the comparison to you. `diff_bytes` is null when it could not be measured, which is not the same as zero.
 
@@ -209,11 +259,11 @@ Settings live in `${CODEX_HOME:-~/.codex}/corvee/config.toml`; the key lives bes
 
 Reads are windowed: `read_file` streams to the requested `start_line`, so a large log can be paged rather than refused, and one window returns at most 30 KB. Editing tools still require the whole file to fit in 200 KB. Directory listings cap at 1000 entries and say so, whether ripgrep or the fallback answered. A search stops after 120 seconds across all batches and reports partial results rather than consuming the run budget.
 
-Mission text and tool results are sent to the configured provider. File tools operate inside the selected repository; read-only mode omits editing tools. The delegate has no arbitrary shell tool, but existing Git helpers can execute during Git inspection (an unresolved audit finding). This is not an OS sandbox or a comprehensive secret scanner: delegate only content you may share and use a sanitized checkout where appropriate. Codex independently verifies returned work.
+Mission text and tool results are sent to the configured provider. File tools operate inside the selected repository; read-only mode omits editing tools. The delegate has no arbitrary shell tool. Git inspection uses the read-only Codex executor; the remaining file tools are not an OS sandbox or a comprehensive secret scanner: delegate only content you may share and use a sanitized checkout where appropriate. Codex independently verifies returned work.
 
 Even in `--write` mode, `write_file` and `replace_text` refuse `.git/` and `.codex/corvee/reports/` after resolving symlinks. Writing `.git/hooks/*` or `core.sshCommand` would otherwise execute on your next git operation, and the report tree is the evidence trail. Both remain readable. A `.git` component anywhere in the path is refused, case-insensitively, so vendored checkouts and submodules are covered as well as the root repository.
 
-The delegate cannot directly invoke arbitrary shell commands. Earlier versions exposed a `run_command` tool behind an `--allow-command` allow-list, guarded by a denylist of options that turn a benign binary into a runner for something else (`ssh -oProxyCommand=...`, `git --git-dir`, `find -exec`). That guard could not hold: no flag list makes `git` safe when `git config alias.x '!cmd'` followed by `git x` uses no flag at all. Arbitrary command requests now go to the parent; the Git-helper finding still limits the execution-boundary claim.
+The delegate cannot directly invoke arbitrary shell commands. Earlier versions exposed a `run_command` tool behind an `--allow-command` allow-list, guarded by a denylist of options that turn a benign binary into a runner for something else (`ssh -oProxyCommand=...`, `git --git-dir`, `find -exec`). That guard could not hold: no flag list makes `git` safe when `git config alias.x '!cmd'` followed by `git x` uses no flag at all. Arbitrary command requests now go to the parent. Fixed Git inspection uses the read-only executor; this does not authorize arbitrary worker-selected commands.
 
 Instead the delegate calls `request_command`, which executes nothing: it records the command and the reason, writes both to `report.md` and `status.json`, and exits **65** with the conversation checkpointed. Codex runs the command itself, under its own sandbox and approval, and resumes the delegate with the output:
 

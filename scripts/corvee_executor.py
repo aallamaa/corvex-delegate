@@ -14,7 +14,8 @@ class ExecutorError(RuntimeError):
     """Execution failed; never fall back to an unsandboxed command."""
 
 
-def execute(codex_bin: str, command: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess:
+def execute(codex_bin: str, command: list[str], cwd: Path, timeout: float, *,
+            read_only: bool = False) -> subprocess.CompletedProcess:
     if not command or timeout <= 0:
         raise ExecutorError("invalid command or timeout")
     deadline = time.monotonic() + timeout + 10
@@ -67,7 +68,8 @@ def execute(codex_bin: str, command: list[str], cwd: Path, timeout: float) -> su
         send({"id": 2, "method": "command/exec", "params": {
             "command": command, "cwd": str(cwd), "timeoutMs": int(timeout * 1000),
             "outputBytesCap": 32768,
-            "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": False},
+            "sandboxPolicy": ({"type": "readOnly"} if read_only else
+                              {"type": "workspaceWrite", "networkAccess": False}),
         }})
         result = receive(2)
         if (not isinstance(result, dict) or type(result.get("exitCode")) is not int
