@@ -1585,6 +1585,43 @@ class RunDirConfinementTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("inside the --cwd repository", result.stderr)
 
+    def test_default_run_dir_symlink_escape_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as outside:
+            root = Path(repo)
+            (root / ".codex").symlink_to(outside, target_is_directory=True)
+            mission = root / "mission.md"
+            mission.write_text("inspect")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--no-config", "--model", "mock",
+                 "--mission", str(mission), "--cwd", repo, "--dry-run"],
+                env={"CORVEX_API_KEY": "test-secret"}, text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("inside the --cwd repository", result.stderr)
+            self.assertEqual(list(Path(outside).iterdir()), [])
+
+    def test_custom_run_artifacts_are_protected_through_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            root = Path(repo).resolve()
+            run_dir = root / "artifacts" / "run"
+            run_dir.mkdir(parents=True)
+            evidence = run_dir / "events.jsonl"
+            evidence.write_text("original")
+            (root / "alias").symlink_to(run_dir, target_is_directory=True)
+            tools = corvee.RepositoryTools(root, True, run_dir=run_dir)
+            for prefix in ("artifacts/run", "alias"):
+                for name, args in (
+                    ("write_file", {"content": "forged"}),
+                    ("replace_text", {"old_text": "original", "new_text": "forged"}),
+                ):
+                    with self.subTest(prefix=prefix, tool=name):
+                        result = json.loads(tools.execute(name, {"path": prefix + "/events.jsonl", **args}))
+                        self.assertFalse(result["ok"])
+                        self.assertIn("write-protected", result["error"])
+            self.assertEqual(evidence.read_text(), "original")
+            self.assertIn("original", tools.tool_read_file("alias/events.jsonl"))
+            tools.tool_write_file("artifacts/ordinary.txt", "allowed")
+
     def test_run_dir_inside_repo_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             mission = Path(repo) / "mission.md"
@@ -1950,14 +1987,14 @@ class RunStateProtectionTest(unittest.TestCase):
             self.assertTrue(marker.is_file())
             self.assertIn("corvee/reports/", marker.read_text(encoding="utf-8"))
 
-    def test_an_existing_gitignore_is_left_alone(self) -> None:
+    def test_an_existing_gitignore_is_preserved_and_extended(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".codex").mkdir()
             marker = root / ".codex" / ".gitignore"
             marker.write_text("mine\n", encoding="utf-8")
             corvee._protect_run_state(root / ".codex" / "corvee" / "reports" / "abc")
-            self.assertEqual(marker.read_text(encoding="utf-8"), "mine\n")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "mine\n/corvee/reports/\n")
 
     def test_a_custom_run_dir_outside_codex_gets_a_parent_gitignore(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1966,6 +2003,29 @@ class RunStateProtectionTest(unittest.TestCase):
             marker = run_dir.parent / ".gitignore"
             self.assertTrue(marker.is_file())
             self.assertIn("run/", marker.read_text(encoding="utf-8"))
+
+    def test_existing_rules_and_special_custom_paths_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            for relative in ("run", ".codex/custom[1] run", ".codex/corvee/reports/abc"):
+                with self.subTest(relative=relative):
+                    run_dir = root / relative
+                    marker = (root / ".codex" / ".gitignore" if "corvee/reports" in relative
+                              else run_dir.parent / ".gitignore")
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_text("*.pyc\n!*/")
+                    corvee._protect_run_state(run_dir)
+                    first = marker.read_text()
+                    self.assertTrue(first.startswith("*.pyc\n!*/\n"))
+                    corvee._protect_run_state(run_dir)
+                    self.assertEqual(marker.read_text(), first)
+                    run_dir.mkdir(parents=True)
+                    checkpoint = run_dir / "checkpoint.json"
+                    checkpoint.write_text("private source")
+                    result = subprocess.run(["git", "check-ignore", "--", str(checkpoint)],
+                                            cwd=root, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
 
 
@@ -2289,6 +2349,60 @@ class UsageAccountingTest(unittest.TestCase):
         self.assertEqual(status["usage"]["total_tokens"], 10)
         self.assertTrue(status["usage"]["reported_by_provider"])
 
+    def test_resume_accumulates_counters_without_reusing_diff_snapshot(self) -> None:
+        journal = self.journal()
+        journal.economics["mission_bytes"] = 42
+        journal.record_usage({"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120})
+        journal.record_tool_result("abc")
+        journal.diff_measurer = lambda: 10
+        journal.finish("command_requested", 65)
+        resumed = corvee.RunJournal(self.run_dir, "secret", resume=True)
+        resumed.record_usage({"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55})
+        resumed.record_tool_result("defg")
+        resumed.diff_measurer = lambda: 25
+        resumed.finish("report_returned", 0)
+        status = json.loads((self.run_dir / "status.json").read_text())
+        self.assertEqual(status["usage"], {"requests": 2, "prompt_tokens": 150,
+                         "completion_tokens": 25, "total_tokens": 175, "reported_by_provider": True})
+        self.assertEqual(status["economics"]["mission_bytes"], 42)
+        self.assertEqual(status["economics"]["delegate_tool_bytes"], 7)
+        self.assertEqual(status["economics"]["delegate_tool_calls"], 2)
+        self.assertEqual(status["economics"]["diff_bytes"], 25)
+        again = corvee.RunJournal(self.run_dir, "secret", resume=True)
+        again.finish("failed", 1)
+        self.assertEqual(json.loads((self.run_dir / "status.json").read_text())["usage"], status["usage"])
+
+    def test_resume_prefers_new_checkpoint_over_old_status(self) -> None:
+        journal = self.journal()
+        journal.record_usage({"total_tokens": 120})
+        journal.finish("interrupted", 130)
+        resumed = corvee.RunJournal(self.run_dir, "secret", resume=True)
+        resumed.record_usage({"total_tokens": 55})
+        resumed.checkpoint([], "tool_completed")  # Interrupted before finish.
+        again = corvee.RunJournal(self.run_dir, "secret", resume=True)
+        self.assertEqual(again.usage["total_tokens"], 175)
+
+    def test_legacy_checkpoint_restores_status_accounting(self) -> None:
+        journal = self.journal()
+        journal.record_usage({"total_tokens": 120})
+        journal.finish("interrupted", 130)
+        checkpoint = self.run_dir / "checkpoint.json"
+        payload = json.loads(checkpoint.read_text())
+        del payload["usage"], payload["economics"]
+        checkpoint.write_text(json.dumps(payload))
+        resumed = corvee.RunJournal(self.run_dir, "secret", resume=True)
+        self.assertEqual(resumed.usage["total_tokens"], 120)
+
+    def test_invalid_saved_counters_are_refused(self) -> None:
+        journal = self.journal()
+        journal.finish("interrupted", 130)
+        checkpoint = self.run_dir / "checkpoint.json"
+        payload = json.loads(checkpoint.read_text())
+        payload["usage"]["total_tokens"] = -1
+        checkpoint.write_text(json.dumps(payload))
+        with self.assertRaisesRegex(OSError, "invalid saved accounting"):
+            corvee.RunJournal(self.run_dir, "secret", resume=True)
+
     def test_run_steps_records_usage_from_the_provider(self) -> None:
         tools = corvee.RepositoryTools(Path.cwd(), False)
         client = corvee.ApiClient("https://example.com", "fake")
@@ -2460,6 +2574,396 @@ class InvocationErrorTest(unittest.TestCase):
     def test_unusable_arguments_exit_two(self) -> None:
         # Documented alongside 0/1/3/75/124/130; it was reachable but unlisted.
         self.assertEqual(self.run_cli("--max-steps", "0").returncode, 2)
+
+
+class MaxOutputTokensForwardingTest(unittest.TestCase):
+    def response(self, content=None):
+        return {"choices": [{"message": {"content": content, "tool_calls": []}}]}
+
+    def test_max_output_tokens_is_forwarded(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False)
+        client = corvee.ApiClient("https://example.com", "fake")
+        with patch.object(client, "call", return_value=self.response("done")) as call:
+            result = corvee.run_steps(client, tools, [], "mock", None, 2, 100,
+                                      max_output_tokens=512)
+        self.assertEqual(result, 0)
+        payload = call.call_args.args[2]
+        self.assertIn("max_tokens", payload)
+        self.assertEqual(payload["max_tokens"], 512)
+
+    def test_no_max_output_tokens_omits_field(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False)
+        client = corvee.ApiClient("https://example.com", "fake")
+        with patch.object(client, "call", return_value=self.response("done")) as call:
+            result = corvee.run_steps(client, tools, [], "mock", None, 2, 100)
+        self.assertEqual(result, 0)
+        payload = call.call_args.args[2]
+        self.assertNotIn("max_tokens", payload)
+
+
+class ThinkingForwardingTest(unittest.TestCase):
+    def response(self, content=None):
+        return {"choices": [{"message": {"content": content, "tool_calls": []}}]}
+
+    def test_thinking_enabled_maps_to_chat_template_kwargs(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False)
+        client = corvee.ApiClient("https://example.com", "fake")
+        with patch.object(client, "call", return_value=self.response("done")) as call:
+            result = corvee.run_steps(client, tools, [], "mock", None, 2, 100,
+                                      thinking="enabled")
+        self.assertEqual(result, 0)
+        payload = call.call_args.args[2]
+        self.assertIn("chat_template_kwargs", payload)
+        self.assertTrue(payload["chat_template_kwargs"]["enable_thinking"])
+
+    def test_thinking_disabled_maps_to_false(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False)
+        client = corvee.ApiClient("https://example.com", "fake")
+        with patch.object(client, "call", return_value=self.response("done")) as call:
+            result = corvee.run_steps(client, tools, [], "mock", None, 2, 100,
+                                      thinking="disabled")
+        self.assertEqual(result, 0)
+        payload = call.call_args.args[2]
+        self.assertIn("chat_template_kwargs", payload)
+        self.assertFalse(payload["chat_template_kwargs"]["enable_thinking"])
+
+    def test_no_thinking_omits_chat_template_kwargs(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False)
+        client = corvee.ApiClient("https://example.com", "fake")
+        with patch.object(client, "call", return_value=self.response("done")) as call:
+            result = corvee.run_steps(client, tools, [], "mock", None, 2, 100)
+        self.assertEqual(result, 0)
+        payload = call.call_args.args[2]
+        self.assertNotIn("chat_template_kwargs", payload)
+
+
+class ReasoningContentPreservedTest(unittest.TestCase):
+    def test_reasoning_content_preserved_in_history_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "fixture.txt"
+            fixture.write_text("small file")
+            run_dir = Path(tmp) / "run"
+            tools = corvee.RepositoryTools(Path(tmp), False)
+            client = corvee.ApiClient("https://example.com", "fake")
+            journal = corvee.RunJournal(run_dir, "fake")
+            captured = []
+            responses = [
+                {"choices": [{"message": {"content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": json.dumps({"path": str(fixture)})}}], "reasoning_content": "secret thoughts"}, "finish_reason": "tool_calls"}]},
+                {"choices": [{"message": {"content": "done", "tool_calls": []}, "finish_reason": "stop"}]},
+            ]
+            def capture_call(method, path, payload):
+                captured.append(json.loads(json.dumps(payload)))
+                return responses.pop(0)
+            msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+            with patch.object(client, "call", side_effect=capture_call):
+                with patch("sys.stderr", new=io.StringIO()):
+                    code = corvee.run_steps(client, tools, msgs, "mock", None, 3, 100, journal=journal)
+            self.assertEqual(code, 0)
+            assistant_msgs = [m for m in msgs if m.get("role") == "assistant"]
+            self.assertEqual(assistant_msgs[0].get("reasoning_content"), "secret thoughts")
+            self.assertEqual(next(m for m in captured[1]["messages"] if m.get("role") == "assistant")["reasoning_content"], "secret thoughts")
+            checkpoint = json.loads((run_dir / "checkpoint.json").read_text())
+            found = [m for m in checkpoint["messages"] if m.get("role") == "assistant"]
+            self.assertEqual(found[0].get("reasoning_content"), "secret thoughts")
+            events = (run_dir / "events.jsonl").read_text()
+            self.assertNotIn("secret thoughts", events)
+
+
+class FinishReasonRejectedTest(unittest.TestCase):
+    def test_unknown_reason_returns_incomplete(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False)
+        client = corvee.ApiClient("https://example.com", "fake")
+        responses = [
+            {"choices": [{"message": {"content": "text", "tool_calls": []}, "finish_reason": "unknown"}]},
+        ]
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        with patch.object(client, "call", side_effect=responses):
+            with patch.object(tools, "execute") as execute:
+                code = corvee.run_steps(client, tools, msgs, "mock", None, 2, 100)
+                execute.assert_not_called()
+        self.assertEqual(code, 3)
+
+    def test_content_filter_reason_returns_incomplete(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False)
+        client = corvee.ApiClient("https://example.com", "fake")
+        responses = [
+            {"choices": [{"message": {"content": "bad", "tool_calls": []}, "finish_reason": "content_filter"}]},
+        ]
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        with patch.object(client, "call", side_effect=responses):
+            code = corvee.run_steps(client, tools, msgs, "mock", None, 2, 100)
+        self.assertEqual(code, 3)
+
+    def test_finish_reason_persisted_in_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            tools = corvee.RepositoryTools(Path(tmp), False)
+            client = corvee.ApiClient("https://example.com", "fake")
+            journal = corvee.RunJournal(run_dir, "fake")
+            responses = [
+                {"choices": [{"message": {"content": "done", "tool_calls": []}, "finish_reason": "stop"}]},
+            ]
+            msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+            with patch.object(client, "call", side_effect=responses):
+                with patch("sys.stderr", new=io.StringIO()):
+                    corvee.run_steps(client, tools, msgs, "mock", None, 2, 100, journal=journal)
+            journal.finish("report_returned", 0)
+            status = json.loads((run_dir / "status.json").read_text())
+            self.assertEqual(status["finish_reason"], "stop")
+            checkpoint = json.loads((run_dir / "checkpoint.json").read_text())
+            self.assertEqual(checkpoint["finish_reason"], "stop")
+
+
+class OutputLimitedResumeTest(unittest.TestCase):
+    def test_truncated_tool_call_never_executes(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False)
+        client = corvee.ApiClient("https://example.com", "fake")
+        responses = [
+            {"choices": [{"message": {"content": None, "tool_calls": [{"id": "1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"/etc/passwd\"}"}}]}, "finish_reason": "length"}]},
+        ]
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        with patch.object(client, "call", side_effect=responses):
+            with patch.object(tools, "execute") as execute:
+                code = corvee.run_steps(client, tools, msgs, "mock", None, 2, 100)
+                execute.assert_not_called()
+        self.assertEqual(code, 3)
+
+    def test_truncated_text_never_success(self):
+        tools = corvee.RepositoryTools(Path.cwd(), False)
+        client = corvee.ApiClient("https://example.com", "fake")
+        responses = [
+            {"choices": [{"message": {"content": "partial report", "tool_calls": []}, "finish_reason": "length"}]},
+        ]
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        with patch.object(client, "call", side_effect=responses):
+            code = corvee.run_steps(client, tools, msgs, "mock", None, 2, 100)
+        self.assertEqual(code, 3)
+
+    def test_loader_output_limited_preserves_prior_messages_and_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            checkpoint = {
+                "version": 1,
+                "step": 2,
+                "phase": "output_limited",
+                "messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "prior", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "t1", "content": "ok"},
+                    {"role": "assistant", "content": "partial", "tool_calls": []},
+                ],
+                "usage": {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "reported_by_provider": False},
+                "economics": {"mission_bytes": 0, "delegate_tool_bytes": 0, "delegate_tool_calls": 0, "report_bytes": 0, "diff_bytes": None},
+                "run_context": {"cwd": str(Path(tmp)), "write": False},
+            }
+            (run_dir / "checkpoint.json").write_text(json.dumps(checkpoint))
+            messages, next_step, phase, pending_trimmed, _run_context = corvee._load_checkpoint_messages(run_dir)
+            self.assertEqual(next_step, 2)
+            self.assertEqual(phase, "output_limited")
+            self.assertFalse(pending_trimmed)
+            self.assertEqual(len(messages), 4)
+            self.assertEqual(messages[-1].get("role"), "tool")
+            self.assertEqual(messages[-2].get("role"), "assistant")
+            self.assertEqual(messages[-2].get("content"), "prior")
+
+
+class FeedbackValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, sys, "argv", sys.argv[:])
+
+    def test_feedback_refused_without_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mission = Path(tmp) / "mission.txt"
+            mission.write_text("do something")
+            fb = Path(tmp) / "fb.txt"
+            fb.write_text("test")
+            with patch.dict("os.environ", {"CORVEX_API_KEY": "fake"}):
+                with patch.object(corvee.ApiClient, "call") as call:
+                    with self.assertRaises(SystemExit):
+                        with redirect_stderr(io.StringIO()):
+                            sys.argv = ["corvee", "--no-config", "--model", "mock", "--cwd", tmp,
+                                        "--mission", str(mission),
+                                        "--feedback", str(fb),
+                                        "--run-dir", str(Path(tmp) / "r1")]
+                            corvee.main()
+                    call.assert_not_called()
+
+    def test_feedback_refused_when_too_large(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mission = Path(tmp) / "mission.txt"
+            mission.write_text("do something")
+            fb = Path(tmp) / "fb.txt"
+            fb.write_text("x" * (corvee.MAX_COMMAND_RESULT_BYTES + 1))
+            run_dir = Path(tmp) / "r1"
+            run_dir.mkdir()
+            (run_dir / "checkpoint.json").write_text(json.dumps({
+                "version": 1, "step": 1, "phase": "ready",
+                "messages": [{"role": "system", "content": "s"}],
+                "run_context": {"cwd": str(Path(tmp)), "write": False},
+            }))
+            with patch.dict("os.environ", {"CORVEX_API_KEY": "fake"}):
+                with patch.object(corvee.ApiClient, "call") as call:
+                    with self.assertRaises(SystemExit):
+                        with redirect_stderr(io.StringIO()):
+                            sys.argv = ["corvee", "--no-config", "--model", "mock", "--cwd", tmp,
+                                        "--resume", str(run_dir),
+                                        "--feedback", str(fb)]
+                            corvee.main()
+                    call.assert_not_called()
+
+    def test_feedback_refused_with_pending_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mission = Path(tmp) / "mission.txt"
+            mission.write_text("do something")
+            fb = Path(tmp) / "fb.txt"
+            fb.write_text("test")
+            run_dir = Path(tmp) / "r1"
+            run_dir.mkdir()
+            (run_dir / "checkpoint.json").write_text(json.dumps({
+                "version": 1, "step": 1, "phase": "command_requested",
+                "messages": [{"role": "system", "content": "s"}],
+                "run_context": {"cwd": str(Path(tmp)), "write": False},
+            }))
+            with patch.dict("os.environ", {"CORVEX_API_KEY": "fake"}):
+                with patch.object(corvee.ApiClient, "call") as call:
+                    with self.assertRaises(SystemExit):
+                        with redirect_stderr(io.StringIO()):
+                            sys.argv = ["corvee", "--no-config", "--model", "mock", "--cwd", tmp,
+                                        "--resume", str(run_dir),
+                                        "--feedback", str(fb)]
+                            corvee.main()
+                    call.assert_not_called()
+
+    def test_feedback_refused_with_command_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fb = Path(tmp) / "fb.txt"
+            fb.write_text("test")
+            cr = Path(tmp) / "cr.txt"
+            cr.write_text("out")
+            run_dir = Path(tmp) / "r1"
+            run_dir.mkdir()
+            (run_dir / "checkpoint.json").write_text(json.dumps({
+                "version": 1, "step": 1, "phase": "ready",
+                "messages": [{"role": "system", "content": "s"}],
+                "run_context": {"cwd": str(Path(tmp)), "write": False},
+            }))
+            with patch.dict("os.environ", {"CORVEX_API_KEY": "fake"}):
+                with patch.object(corvee.ApiClient, "call") as call:
+                    with self.assertRaises(SystemExit):
+                        with redirect_stderr(io.StringIO()):
+                            sys.argv = ["corvee", "--no-config", "--model", "mock", "--cwd", tmp,
+                                        "--resume", str(run_dir),
+                                        "--feedback", str(fb),
+                                        "--command-result", str(cr)]
+                            corvee.main()
+                    call.assert_not_called()
+
+    def test_valid_feedback_resume_includes_delimited_feedback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mission = Path(tmp) / "mission.txt"
+            mission.write_text("do something")
+            fb = Path(tmp) / "fb.txt"
+            fb.write_text("fix the bug")
+            run_dir = Path(tmp) / "r1"
+            run_dir.mkdir()
+            (run_dir / "checkpoint.json").write_text(json.dumps({
+                "version": 1, "step": 1, "phase": "ready",
+                "messages": [{"role": "system", "content": "s"}],
+                "run_context": {"cwd": str(Path(tmp)), "write": False},
+            }))
+            captured_payload = []
+            def capture_call(self_client, method, path, payload):
+                captured_payload.append(json.loads(json.dumps(payload)))
+                return {"choices": [{"message": {"content": "done", "tool_calls": []}, "finish_reason": "stop"}]}
+            with patch.dict("os.environ", {"CORVEX_API_KEY": "fake"}):
+                with patch.object(corvee.ApiClient, "call", new=capture_call):
+                    with patch("sys.stderr", new=io.StringIO()):
+                        sys.argv = ["corvee", "--no-config", "--model", "mock", "--cwd", tmp,
+                                    "--resume", str(run_dir),
+                                    "--feedback", str(fb)]
+                        code = corvee.main()
+            self.assertEqual(code, 0)
+            self.assertTrue(captured_payload)
+            feedback_msg = captured_payload[0]["messages"][-1]
+            self.assertIn("----- BEGIN UNTRUSTED FEEDBACK -----", feedback_msg["content"])
+            self.assertIn("fix the bug", feedback_msg["content"])
+            self.assertIn("----- END UNTRUSTED FEEDBACK -----", feedback_msg["content"])
+
+
+class RunStepsParamsPersistenceTest(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, sys, "argv", sys.argv[:])
+
+    def test_resume_restores_omitted_params_and_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mission = Path(tmp) / "mission.txt"
+            mission.write_text("do something")
+            run_dir = Path(tmp) / "r1"
+            captured = []
+            def capture_call(self_client, method, path, payload):
+                captured.append(json.loads(json.dumps(payload)))
+                return {"choices": [{"message": {"content": "done", "tool_calls": []}, "finish_reason": "stop"}]}
+            with patch.dict("os.environ", {"CORVEX_API_KEY": "fake"}):
+                with patch.object(corvee.ApiClient, "call", new=capture_call):
+                    with patch("sys.stderr", new=io.StringIO()):
+                        sys.argv = ["corvee", "--no-config", "--model", "mock", "--cwd", tmp,
+                                    "--mission", str(mission),
+                                    "--effort", "low", "--thinking", "disabled",
+                                    "--max-output-tokens", "8192",
+                                    "--run-dir", str(run_dir)]
+                        code = corvee.main()
+            self.assertEqual(code, 0)
+            self.assertEqual(captured[0]["reasoning_effort"], "low")
+            self.assertFalse(captured[0]["chat_template_kwargs"]["enable_thinking"])
+            self.assertEqual(captured[0]["max_tokens"], 8192)
+
+            captured2 = []
+            def capture_call2(self_client, method, path, payload):
+                captured2.append(payload)
+                return {"choices": [{"message": {"content": "done", "tool_calls": []}, "finish_reason": "stop"}]}
+            with patch.dict("os.environ", {"CORVEX_API_KEY": "fake"}):
+                with patch.object(corvee.ApiClient, "call", new=capture_call2):
+                    with patch("sys.stderr", new=io.StringIO()):
+                        sys.argv = ["corvee", "--no-config", "--model", "mock", "--cwd", tmp,
+                                    "--resume", str(run_dir)]
+                        code2 = corvee.main()
+            self.assertEqual(code2, 0)
+            self.assertEqual(captured2[0]["reasoning_effort"], "low")
+            self.assertFalse(captured2[0]["chat_template_kwargs"]["enable_thinking"])
+            self.assertEqual(captured2[0]["max_tokens"], 8192)
+
+            captured3 = []
+            def capture_call3(self_client, method, path, payload):
+                captured3.append(payload)
+                return {"choices": [{"message": {"content": "done", "tool_calls": []}, "finish_reason": "stop"}]}
+            with patch.dict("os.environ", {"CORVEX_API_KEY": "fake"}):
+                with patch.object(corvee.ApiClient, "call", new=capture_call3):
+                    with patch("sys.stderr", new=io.StringIO()):
+                        sys.argv = ["corvee", "--no-config", "--model", "mock", "--cwd", tmp,
+                                    "--resume", str(run_dir),
+                                    "--effort", "high", "--max-output-tokens", "4096"]
+                        code3 = corvee.main()
+            self.assertEqual(code3, 0)
+            self.assertEqual(captured3[0]["reasoning_effort"], "high")
+            self.assertFalse(captured3[0]["chat_template_kwargs"]["enable_thinking"])
+            self.assertEqual(captured3[0]["max_tokens"], 4096)
+
+    def test_negative_max_output_tokens_fails_before_inference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mission = Path(tmp) / "mission.txt"
+            mission.write_text("do something")
+            with patch.dict("os.environ", {"CORVEX_API_KEY": "fake"}):
+                with patch.object(corvee.ApiClient, "call") as call:
+                    with self.assertRaises(SystemExit):
+                        with redirect_stderr(io.StringIO()):
+                            sys.argv = ["corvee", "--no-config", "--model", "mock", "--cwd", tmp,
+                                        "--mission", str(mission),
+                                        "--max-output-tokens", "-1",
+                                        "--run-dir", str(Path(tmp) / "r1")]
+                            corvee.main()
+                    call.assert_not_called()
 
 
 class EffortForwardingTest(unittest.TestCase):

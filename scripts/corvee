@@ -39,7 +39,7 @@ def main() -> int:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print("Usage: corvee COMMAND [OPTIONS]")
         print("Durations accept seconds or a 30s/30m/2h suffix.")
-        print("Commands: configure, models [PATTERN], select [MODEL|auto], check, cleanup, run")
+        print("Commands: configure, models [PATTERN], select [MODEL|auto], check, cleanup, run, job")
         print("With no MODEL, 'select' prints the current non-secret settings.")
         print("For command help: corvee COMMAND --help")
         print("target, analyze, refine, loop, audit and status are Codex skill instructions;")
@@ -100,6 +100,13 @@ def main() -> int:
         if summary["failed"] > 0:
             return 1
         return 0
+    if command == "job":
+        from corvee_job import main as job
+
+        if shared_prefix:
+            print("job options must follow the job subcommand", file=sys.stderr)
+            return 2
+        return job(arguments)
     if command == "run":
         from corvee import main as run
 

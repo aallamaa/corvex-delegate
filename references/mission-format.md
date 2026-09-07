@@ -1,47 +1,38 @@
 # Delegate mission format
 
-Write each mission as a short, self-contained Markdown file. The delegate receives no hidden primary-agent reasoning and should not need prior chat history.
+Prefer the user's existing task over rewriting it. Add only what the worker
+cannot infer safely. A routine mission is usually 100–200 words:
 
 ```markdown
-# Mission: <bounded unit>
+## Outcome
+The requested observable change.
 
-## Objective
-One deliverable tied to one target gate.
+## Scope and evidence
+Files/components allowed to change; useful entry points; known pre-existing edits.
 
-## Working directory
-Absolute repository root.
+## Constraints
+Compatibility and architectural decisions already made. Let the worker choose
+ordinary implementation details; do not require a complete planner-written patch.
 
-## Current evidence
-Relevant files, symbols, observed failures, and pre-existing changes.
+## Acceptance
+The command the parent will run and any additional checks it cannot automate.
+Do not weaken or edit the gate. Do not run or request commands for routine
+verification; the parent will return failures through --resume --feedback.
 
-## Decided approach
-Architecture and constraints already chosen by Codex.
-
-## Scope
-Files or components the delegate may inspect or edit.
-
-## Non-goals and forbidden actions
-No scope expansion; no credentials, production actions, commit, push, release,
-dependency upgrade, or destructive command unless explicitly authorized here.
-
-## Required work
-Concrete implementation or analysis tasks.
-
-## Verification the delegate can offer
-Evidence the delegate can gather by reading -- the code path it changed, the
-call sites it checked. The delegate cannot run anything, so this is reasoning
-to be checked, never a claim that a test passed. It may call `request_command`
-to ask you to run something, which suspends the run; say here whether that is
-worth a round trip for this mission, or whether it should report what it has
-and let the next iteration carry the answer.
-
-## Evidence report
-- summary of result;
-- files changed;
-- tool calls or commands run and their outcomes;
-- remaining failures, uncertainties, and assumptions;
-- whether the objective is complete, with supporting evidence.
+## Report
+At most 150 words: changed files, why the change meets the task, and uncertainties.
+Do not claim tests ran. Stop when the patch is ready for parent verification.
 ```
+
+The worker receives no hidden planner reasoning. Include necessary context but
+avoid full source dumps where a path/symbol is sufficient. Do not make a separate
+Astra planning call for a task whose outcome, scope, and gate are already clear.
+For ambiguous design, Codex resolves the ambiguity before authorizing writes.
+
+The parent runs the authorized gate under its own execution boundary. Return
+concise failures to the same run with `--feedback`; keep repair ownership with
+the cheap worker. Preserve the original scope and remaining budget. Do not
+silently promote a read-only worker or run commands based on its report.
 
 ## Audit missions
 

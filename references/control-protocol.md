@@ -1,5 +1,15 @@
 # Goal control protocol
 
+For bounded edits with known source files and an executable gate, prefer the
+[deterministic job workflow](job-workflow.md). It handles routine tests, repairs,
+and cheap review without Astra inference. The planner workflows below remain
+for discovery, architectural decisions, ambiguous targets, and escalations;
+do not wrap each job attempt in another Astra planning/review cycle.
+
+
+Use this protocol for multi-iteration goals. For a bounded one-off task, use
+the compact mission/repair workflow in SKILL.md without creating target state.
+
 Use a durable control directory in the target repository:
 
 ```text
@@ -11,7 +21,7 @@ Use a durable control directory in the target repository:
 `-- reports/
 ```
 
-The runner writes a `.codex/.gitignore` that excludes `corvee/reports/` the first time it creates a run directory, because checkpoints embed repository content. `TARGET.md` and `STATE.md` are meant to be reviewed and may be committed.
+The runner preserves `.codex/.gitignore` content and appends a `corvee/reports/` exclusion when needed, because checkpoints embed repository content. `TARGET.md` and `STATE.md` are meant to be reviewed and may be committed.
 
 Create or update these files with normal Codex file-editing tools. Do not store API keys, authorization headers, full environment dumps, or secret-bearing provider configuration in them.
 
@@ -100,23 +110,26 @@ Improve the target and route to it. Resolve vague gates, remove accidental scope
 
 ### `run`
 
-Execute exactly one controlled iteration:
+Execute one controlled iteration:
 
-1. select the highest-leverage unmet gate whose prerequisites are satisfied;
-2. create one bounded mission;
-3. run one delegate, or a small read-only fan-out for genuinely independent analysis;
-4. rerun the gate command yourself and read its exit code;
-5. read the change to the extent the gate does not cover it, which for an
-   ordinary diff means reading it;
-6. update `STATE.md` and stop after reporting the next state.
+1. choose the next unmet gate and reuse the task as a compact mission;
+2. let the worker investigate and implement within its scope;
+3. inspect its status, then run the authorized gate in the parent session;
+4. return failures with `--resume --feedback` for bounded worker repairs;
+5. after gates pass, review the actual diff and remaining risks in the existing
+   Codex session; launch a separate reviewer only when warranted;
+6. record acceptance evidence and cost, including failed attempts.
 
-Step 4 is not optional and is not delegable: the delegate's own claim that a
-check passed is evidence, not proof. The stronger the gate command, the less of
-step 5 is left to do.
+The gate in step 3 is authoritative. Limit routine repairs to two attempts and
+remaining iteration/time/spend budgets; do not turn an output cap into an
+unbounded retry loop. Prefer worker repair to an automatic expensive rewrite.
+
+Running the parent gate is not optional and is not delegable: the delegate's own claim that a
+check passed is evidence, not proof. Gate coverage informs the depth of final review; it does not eliminate it.
 
 Use a fresh direct-runner context for each mission. A failed or timed-out run may have left partial edits; inspect before retrying. Capture the report and exit status in `reports/`. Do not include credential values or environment dumps.
 
-The runner creates a private per-run artifact directory automatically; use `--run-dir` to name a new directory explicitly. Its stderr carries only run boundaries and errors, so read `status.json` for the outcome and `events.jsonl` for the full trace rather than passing `--verbose` by habit. `checkpoint.json` preserves conversation/tool results and may contain private repository content. Inspect it locally as needed; do not paste it wholesale into chat or a new mission. Use `scripts/corvee run --resume <run-dir>` to continue from the latest checkpoint when safe, and keep `tool_pending` behavior conservative. A resume reuses the original run's write mode and allowed commands; a conflicting flag is refused.
+The runner creates a private per-run artifact directory automatically; use `--run-dir` to name a new directory explicitly. Its stderr carries only run boundaries and errors, so read `status.json` for the outcome and `events.jsonl` for the full trace rather than passing `--verbose` by habit. `checkpoint.json` preserves conversation/tool results and may contain private repository content. Inspect it locally as needed; do not paste it wholesale into chat or a new mission. Use `scripts/corvee run --resume <run-dir>` to continue from the latest checkpoint when safe, and keep `tool_pending` behavior conservative. A resume preserves original write authority; read-only cannot be widened. Inference controls are restored when omitted and may be explicitly changed for recovery.
 
 Request timeouts default to 600 seconds; retain that allowance for slow models unless the user requests less. The total run budget still wins. A transient request can retry once (up to two with `--request-retries 2`), with possible duplicate provider charges, but completed local tools are not rerun. Do not restart an entire mission merely because one inference request timed out.
 

@@ -8,6 +8,47 @@ GPT decides what to do and checks whether it worked. Corvex executes clearly sco
 
 Includes model discovery, protected credential setup, persistent target tracking, and bounded execution loops. Connects directly to Corvex's OpenAI-compatible API; no OMP or third-party agent framework is required.
 
+## Measured results
+
+A September 7, 2026 pilot compared direct Astra with Astra planning + Corvée
+execution + Astra acceptance. Costs include dedicated planning, worker attempts,
+and final review, including failed attempts.
+
+| Work package | Astra alone | Astra + Corvée | Verified outcome |
+|---|---:|---:|---|
+| Mechanical API migration: 160 callsites across 40 files | $0.452 | $0.190 | Both passed exact transformation checks; **58% lower cost** |
+| Adversarial testing of a four-module SQLite queue | $0.477 | $0.183 spent | Astra returned six reproducing probes; Corvée exhausted its output budget without returning probes |
+| Earlier four-module SQLite queue implementation | $0.634 | $0.663 | Astra accepted; delegated code rejected after additional contract checks |
+
+The successful migration cost **$0.110 for Astra planning, $0.057 for Corvée,
+and $0.023 for Astra acceptance**. Model-phase time increased from 95 seconds
+to 364 seconds. The saving came from submitting executable work and checking
+its exact result, with Astra reviewing compact evidence. This used an experimental
+script/probe harness, not the shipped `corvee job` loop unchanged.
+
+These are single trials, not a general savings guarantee. The migration fixture
+was synthetic with identical-shape calls. Of Astra's six adversarial probes,
+four passed on the separate reference implementation; two exposed contract edge
+cases shared by both implementations. Corvée's failed adversarial attempt is
+not a completed audit or a saving. Both new worker trials used Kimi-K2.7-Code
+with thinking enabled.
+
+Prices are API-equivalent estimates using reported usage and observed caching,
+not measured Codex subscription credits. Shared benchmark construction, root-agent
+orchestration, independent adjudication, and reporting are excluded; model-phase
+times exclude external validation and dispatch gaps. Raw development artifacts
+remain local and are excluded from releases. See [the cost assessment](COST_ASSESSMENT.md)
+for exact accounting, acceptance criteria, limitations, and earlier negative results.
+
+**Practical fit:** delegate substantial, clearly scoped work with executable
+acceptance checks. Corvée should run those checks and repair failures within a
+fixed budget before returning a compact result to Codex. Codex defines acceptance
+and handles unresolved decisions; a worker's own approval is not sufficient
+evidence. Longer work helps only when it amortizes instruction and verification
+costs: the larger queue implementation still failed this test. The migration
+trial supports cheap, decisive acceptance; the implementation and adversarial
+trials do not establish savings for open-ended correctness work.
+
 ## Acknowledgments
 
 Thank you to **Corvex** for generously granting me alpha access to their APIs, which made it possible to build and test this skill.
@@ -17,28 +58,23 @@ Thank you to **Corvex** for generously granting me alpha access to their APIs, w
 Codex can drive an OpenAI-compatible provider directly, so the obvious question
 is why this ships its own runner. The answer is measured, not assumed.
 
-Same mission, same model (`zai-org/GLM-5.2-FP8`), same repository, both
-producing a correct answer:
+A historical pilot compared one small read-only mission on the same Corvex
+model (`zai-org/GLM-5.2-FP8`) with two trials per harness. Corvée averaged
+$0.0405 and `codex exec` $0.0798 in model charges, with both answers recorded
+as correct. Later Corvée-only optimization reduced its mean further, but that
+was not a fresh paired comparison with Codex.
 
-| harness | mean input tokens | mean output | wall clock | cost/mission |
-| --- | --- | --- | --- | --- |
-| this runner | 35,734 | 1,563 | 13 s | **$0.031** |
-| `codex exec` | 96,559 | 3,079 | 25 s | $0.080 |
+This supports keeping a small tool surface for bounded missions. It does not
+prove lower total cost than direct Astra work: mission preparation, independent
+review, retries, and repairs also count. The former 40K-token break-even claim
+is unvalidated. See [the evidence assessment](COST_ASSESSMENT.md).
 
-`codex exec` sends a general-purpose system prompt and a full tool surface on
-every request. A delegate that only reads, searches and edits inside one
-repository does not need that, and the difference is billed on every turn: about
-**2.6x the tokens** for the same result. Codex reported ~90% cached input, but
-Corvex prices `input_cache_read` identically to `prompt`, so the cache buys
-latency rather than money.
+A general-purpose harness also provides capabilities this runner would need to
+maintain itself. Choose on cost per accepted result and the capabilities needed
+for the task, rather than prompt size alone.
 
-What `codex exec` gives you that this does not: a real OS sandbox, command
-execution with approval, and no harness to maintain. If those matter more than
-the token difference, use it -- the runner is not the only reasonable answer,
-just the cheaper one for bounded read-and-edit missions.
-
-The benchmark is `.codex/bench/` in this repository. Reproduce it before
-trusting the numbers; they are one mission on one model.
+Historical benchmark artifacts live under `.codex/bench/` and are excluded
+from releases. They are development evidence, not a supported benchmark suite.
 
 ### What the runner does to stay cheap
 
@@ -107,6 +143,29 @@ Other instructions: `check`, `refine`, `run` (one iteration), `audit`, and `clea
 
 Codex maintains acceptance criteria, missions, and progress in `.codex/corvee/` in the target repository. A loop ends at independently verified completion or its budget/blocking boundary. Loops run in the active Codex session, not as a background service.
 
+## Keep planner involvement small
+
+For experimental bounded edits, `corvee job` runs implementation, an authorized test command,
+repairs, and independent cheap review without calling Astra. Declare the source
+files and immutable gate fixtures; the controller sends exact source packets
+and validates replacement edits. It uses fresh repair contexts and no browsing
+tools. Astra handles architecture and escalated decisions, not routine test
+failures. See [the job workflow](references/job-workflow.md) for the command,
+limits, and meaning of `ready`. Jobs do not merge or deploy.
+
+For exploration or work outside this bounded lane, `corvee run` remains available.
+Earlier integrated implementation trials did not beat direct Astra on accepted
+results. The later migration pilot did, using a different evidence-first harness.
+See [measured results](#measured-results) and [the full assessment](COST_ASSESSMENT.md).
+
+For mechanical work on Corvex GLM-5.2-FP8, the verified control is
+`--thinking disabled --max-output-tokens 8192`. The thinking flag maps to
+`chat_template_kwargs.enable_thinking`; native `thinking.type` and
+`reasoning_effort=low` did not disable reasoning on the tested endpoint.
+Other providers may not support this extension. Omit it unless supported.
+A completion limit must accommodate reasoning as well as visible output when
+thinking is enabled. Truncated responses are incomplete, not successful reports.
+
 ## CLI
 
 One public entry point handles setup and individual missions:
@@ -134,7 +193,7 @@ Inference requests default to a **600-second** socket timeout (`run --http-timeo
 
 The runner keeps its stderr short: one line per run boundary and per error. The complete event stream is always written to `events.jsonl`, and `--verbose` echoes it to stderr as well. Read `status.json` rather than scrolling the stream, so a long run does not consume the planner context this tool exists to save.
 
-Each non-dry run creates a new private directory under `.codex/corvee/reports/`, or at `--run-dir PATH` (which must not already exist). It contains metadata-only `events.jsonl`, `status.json`, `report.md`, and an atomic `checkpoint.json` with conversation and tool results. Directories are mode 0700 and files mode 0600. Checkpoints contain repository content: do not publish them or treat key redaction as a comprehensive secret scanner.
+Each non-dry run creates a new private directory under `.codex/corvee/reports/`, or at `--run-dir PATH` (which must not already exist). It contains metadata-only `events.jsonl`, `status.json`, `report.md`, and an atomic `checkpoint.json` with conversation, tool results, and returned provider reasoning fields. Directories are mode 0700 and files mode 0600. Checkpoints contain repository content: do not publish them or treat key redaction as a comprehensive secret scanner.
 
 To avoid redoing completed work after an interrupted or budget-exhausted run, use `--resume /path/to/run-dir` when rerunning. The runner restores the checkpointed conversation and continues from the next step while preserving prior tool outputs and avoiding duplicate re-execution. It also restores the original run's `--write` mode, so the flag need not be repeated; asking for `--write` on a run that was read-only is refused rather than silently widening the delegate's authority mid-run.
 
@@ -150,11 +209,11 @@ Settings live in `${CODEX_HOME:-~/.codex}/corvee/config.toml`; the key lives bes
 
 Reads are windowed: `read_file` streams to the requested `start_line`, so a large log can be paged rather than refused, and one window returns at most 30 KB. Editing tools still require the whole file to fit in 200 KB. Directory listings cap at 1000 entries and say so, whether ripgrep or the fallback answered. A search stops after 120 seconds across all batches and reports partial results rather than consuming the run budget.
 
-Mission text and tool results are sent to the configured provider. File tools operate inside the selected repository; read-only mode omits editing tools. The delegate has no way to execute a command. This is not an OS sandbox or a comprehensive secret scanner: delegate only content you may share and use a sanitized checkout where appropriate. Codex independently verifies returned work.
+Mission text and tool results are sent to the configured provider. File tools operate inside the selected repository; read-only mode omits editing tools. The delegate has no arbitrary shell tool, but existing Git helpers can execute during Git inspection (an unresolved audit finding). This is not an OS sandbox or a comprehensive secret scanner: delegate only content you may share and use a sanitized checkout where appropriate. Codex independently verifies returned work.
 
 Even in `--write` mode, `write_file` and `replace_text` refuse `.git/` and `.codex/corvee/reports/` after resolving symlinks. Writing `.git/hooks/*` or `core.sshCommand` would otherwise execute on your next git operation, and the report tree is the evidence trail. Both remain readable. A `.git` component anywhere in the path is refused, case-insensitively, so vendored checkouts and submodules are covered as well as the root repository.
 
-The delegate cannot run commands. Earlier versions exposed a `run_command` tool behind an `--allow-command` allow-list, guarded by a denylist of options that turn a benign binary into a runner for something else (`ssh -oProxyCommand=...`, `git --git-dir`, `find -exec`). That guard could not hold: no flag list makes `git` safe when `git config alias.x '!cmd'` followed by `git x` uses no flag at all. Execution now happens only where the user already approves it.
+The delegate cannot directly invoke arbitrary shell commands. Earlier versions exposed a `run_command` tool behind an `--allow-command` allow-list, guarded by a denylist of options that turn a benign binary into a runner for something else (`ssh -oProxyCommand=...`, `git --git-dir`, `find -exec`). That guard could not hold: no flag list makes `git` safe when `git config alias.x '!cmd'` followed by `git x` uses no flag at all. Arbitrary command requests now go to the parent; the Git-helper finding still limits the execution-boundary claim.
 
 Instead the delegate calls `request_command`, which executes nothing: it records the command and the reason, writes both to `report.md` and `status.json`, and exits **65** with the conversation checkpointed. Codex runs the command itself, under its own sandbox and approval, and resumes the delegate with the output:
 

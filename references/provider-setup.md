@@ -26,3 +26,39 @@ The runner accepts temporary URL overrides through `--base-url` or `CORVEX_API_U
 HTTP 401/403 indicates an authentication/access problem. HTTP 404 warrants checking the URL and `/v1` suffix. For unknown models use the live catalog without silently substituting. For unsupported reasoning effort omit `--effort`. Missing tool calls or malformed reports mean incomplete work. Authenticated requests refuse redirects; configure the intended endpoint directly.
 
 The runner uses `POST /chat/completions` with function tools.
+
+## Mechanical-worker inference controls
+
+For Corvex `zai-org/GLM-5.2-FP8`, a live 2026-09-07 probe verified
+`chat_template_kwargs: {"enable_thinking": false}` disables reasoning. Use
+`run --thinking disabled` for that setting. Native `thinking.type: disabled`
+and `reasoning_effort: low` still yielded reasoning-only, length-limited replies
+on this endpoint; accepting a field does not prove that it has an effect.
+This is not a universal mapping for other providers.
+
+`--max-output-tokens N` forwards `max_tokens`; omission keeps the provider
+default. For thinking-enabled work, allow enough output for internal reasoning
+and the actual tool call/report. Inspect `finish_reason`, not just a returned
+message. Length-limited responses cannot execute tools or pass acceptance.
+Controls are restored on resume unless explicitly overridden. No automatic
+output-budget escalation occurs.
+
+[Z.AI thinking documentation](https://docs.z.ai/guides/capabilities/thinking-mode)
+describes native GLM behavior and reasoning continuity; it does not establish
+which fields a third-party Corvex endpoint honors. Provider reasoning fields
+remain private in checkpoints and are forwarded for tool-call continuity.
+
+
+### Kimi thinking control on Corvex
+
+The exact catalog model `moonshotai/Kimi-K2.7-Code` uses
+`chat_template_kwargs.thinking` for its thinking toggle. Both `run` and `job`
+now route `--thinking enabled|disabled` to that key. GLM retains
+`chat_template_kwargs.enable_thinking`; other provider deployments may differ.
+A 256-token probe with Kimi `thinking=false` returned JSON in 1.10s, six output
+tokens, and zero reasoning bytes. This verifies the control, not coding quality.
+
+The upstream [Moonshot K2.5 examples](https://github.com/MoonshotAI/Kimi-K2.5)
+distinguish the native API `thinking.type` setting from the vLLM/SGLang template
+`thinking` boolean. Those older-model docs motivated the probe; they do not by
+themselves establish behavior for Corvex's K2.7 deployment.

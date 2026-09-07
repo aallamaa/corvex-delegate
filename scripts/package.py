@@ -7,14 +7,14 @@ import tarfile
 
 
 PACKAGE_FILES = (
-    "SKILL.md", "README.md", "CHANGELOG.md", "LICENSE", "VERSION",
+    "SKILL.md", "README.md", "CHANGELOG.md", "LICENSE", "VERSION", "COST_ASSESSMENT.md",
     "references/control-protocol.md", "references/mission-format.md",
-    "references/provider-setup.md",
-    "scripts/corvee", "scripts/corvee.py",
+    "references/provider-setup.md", "references/job-workflow.md",
+    "scripts/corvee", "scripts/corvee.py", "scripts/corvee_job.py", "scripts/corvee_executor.py",
     "scripts/corvee_config.py", "scripts/configure_corvee.py",
     "scripts/install.py", "scripts/package.py",
 )
-TEST_FILES = ("tests/test_corvee.py",)
+TEST_FILES = ("tests/test_corvee.py", "tests/test_corvee_job.py", "tests/test_corvee_executor.py")
 # Development-only resources, listed explicitly so a drift check can tell a
 # deliberate exclusion from a newly added file someone forgot to package.
 EXCLUDED_FILES = (
@@ -22,7 +22,6 @@ EXCLUDED_FILES = (
     ".gitignore",
     ".github/workflows/ci.yml",
     "AUDIT_TODO.md",
-    "COST_ASSESSMENT.md",
 )
 
 

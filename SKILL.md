@@ -1,100 +1,142 @@
 ---
 name: corvee
-description: Delegate bounded repository work directly to Corvex models while Codex owns planning and verification. Use for provider setup, model selection, target refinement, and execution loops with measurable acceptance criteria.
+description: Delegate bounded repository reading, implementation, and repair to inexpensive Corvex workers while Codex owns scope and final acceptance.
 ---
 
 # Corvée
 
-Keep architecture, targets, sequencing, review, and acceptance in Codex. Send bounded missions to Corvex through the bundled runner. The primary Codex model is not changed.
+Keep the user's objective, authority, architectural constraints, and final
+acceptance in Codex. Let the cheap worker investigate implementation details,
+edit, and repair its own work. Avoid paying the planner to solve a task before
+handing it off, then paying it again to rewrite the worker's solution.
 
-## When to delegate
+## Experimental lane for bounded work: autonomous cheap execution
 
-The skill's value is **cheap tokens for bulk reading, expensive planner tokens reserved for thinking.** Corvex models cost a fraction of flagship Codex models per token, so moving large-scale code reading and mechanical editing to the delegate saves money and conserves the planner's context window.
+Use `corvee job` for a requested bounded outsourcing trial with known source
+files and an authorized executable acceptance gate. Its first integrated live
+measurement failed to complete; do not represent it as a proven cheaper default.
+Read [job-workflow.md](references/job-workflow.md) for the command and boundaries.
+Declare the existing UTF-8 source files and immutable gate fixtures. This lane
+sends complete source packets and applies exact replacements, with no browsing
+tools. Use cheap discovery via `run` first when entry points are unknown.
+The script coordinates implementation, tests, fresh-context repair, and a separate
+read-only Corvée review. It makes no Astra calls. Give it one coherent task and
+inspect its compact result; avoid manually repeating its gates or reading full
+traces unless evidence is missing or contradictory.
 
-Delegate when the direct work would consume roughly 40K or more tokens of reading — medium-to-large missions on unfamiliar or large codebases. The planner overhead (mission prep, review, gate verification) is roughly constant regardless of mission size, while the delegate's work scales with the codebase, so the larger the mission the stronger the savings.
+Keep Astra for architectural decisions, unclear requirements, cross-component
+tradeoffs, security-sensitive changes, and unresolved escalations. A clear user
+request usually needs only scope, known entry points, compatibility constraints,
+and the authorized gate added. Corvée can investigate and plan its implementation.
+Do not require Astra to solve the task first, review every routine patch, or
+rewrite failed worker code. Batch compatible work under one acceptance contract.
 
-Do small tasks directly. A mission where the delegate spends more tokens exploring the codebase than the planner would spend doing the work itself is a net loss. If the planner already has the context and the task is a few reads and one edit, do it yourself.
+A `ready` result means the gate and independent cheap review passed; it does not
+mean merged, deployed, or guaranteed correct. Present the result to the user.
+Use Astra review when requested or when risk warrants it. An `escalated` result
+should reach Astra as a specific question with minimal supporting evidence, not
+an entire worker transcript. Stop at the configured repair boundary.
 
-## Instructions
+For jobs without an authorized executable gate, use a bounded `run` and verify
+the report in the parent. `--resume --feedback` remains available when preserving
+history is useful; fresh repair jobs are preferred when replay dominates cost.
+For already-known trivial edits, direct work can still cost less than delegation.
 
-The word after `$corvee` is a skill instruction, not a registered slash command. Six of them run the bundled CLI; the rest are planning steps you carry out yourself, with no script behind them.
+## Thinking and execution policy
 
-CLI-backed:
+Prefer thinking enabled for substantive implementation, independent review and
+repairs involving correctness or compatibility. Earlier 8K–16K capped failures
+justify revisiting output/time allowances, not disabling reasoning globally.
+Use instant mode for mechanical edits or an explicitly labeled comparison.
+For thinking jobs, set an explicit allowance such as 32,768 output tokens and
+300 seconds per call, bounded repairs, and stop on exhaustion. These are starting
+budgets, not a validated guarantee or permission to keep retrying.
 
-| Instruction | Purpose |
-| --- | --- |
-| `configure` | Configure URL and credential |
-| `models [PATTERN]` | List live model IDs |
-| `select [MODEL_ID\|auto]` | Show, save, or clear the default model |
-| `check` | Verify credentials with a tiny inference request |
-| `run` | Execute and verify one iteration |
-| `cleanup` | Remove stale run report directories |
+For a declared gate, `job --executor codex --codex-bin /path/to/codex` uses
+Codex app-server `command/exec` with workspace-write and network disabled.
+It creates no model thread/turn, needs no Astra review of each command, and never
+falls back to local execution if the sandbox request fails. It does not authorize
+arbitrary worker-proposed commands. See the job workflow for the exact boundary.
 
-Planning steps you perform (they read and write `.codex/corvee/`, and call `run` when they need a delegate):
+## Running a worker
 
-| Instruction | Purpose |
-| --- | --- |
-| `target GOAL` | Define outcome and acceptance gates |
-| `analyze` | Assess gaps and propose work units; never edits `TARGET.md` |
-| `refine` | Revise `TARGET.md` itself: the only instruction that may |
-| `loop [CONDITION]` | Repeat `run` within a bounded budget |
-| `audit` | Independently challenge completion |
-| `status` | Report progress and remaining gates |
+Find `scripts/corvee` relative to this skill's actual installation directory.
+Read [mission-format.md](references/mission-format.md) for a compact mission
+example. Store missions and run artifacts under `.codex/corvee/` in the target
+repository. Use an exact model ID; serialize writes in a shared worktree.
 
-`analyze` and `refine` are separate so that a gate is never softened because a delegate failed it: only `refine` may change `TARGET.md`.
-
-Write acceptance gates as commands wherever one exists. Checking an exit code costs the planner the same whether the delegate changed three files or three hundred; judging a change by reading it does not.
-
-Read [control-protocol.md](references/control-protocol.md) for target and execution operations. Read [provider-setup.md](references/provider-setup.md) for setup and model selection.
-
-## Setup
-
-Find `scripts/corvee` relative to this skill's actual installation directory. Run `python3 <skill-dir>/scripts/corvee configure` in a local terminal for the hidden-input wizard. Never request keys in chat or pass them in command arguments. Codex may configure non-interactively from an existing environment variable or user-identified dotenv file.
-
-Settings default to `${CODEX_HOME:-~/.codex}/corvee/config.toml`, with the key in a separate mode-0600 `credentials.toml`. `configure` and `check` make a tiny inference request that may incur a charge. The public model catalog does not authenticate the key.
-
-## Delegation
-
-Read [mission-format.md](references/mission-format.md) before preparing a mission. Store target state, missions, and reports under `.codex/corvee/` in the target repository. Keep secrets out of all context sent to Corvex.
-
-Use an exact selected model. Split work that is ambiguous, not work that is merely large: every mission costs the planner a specification, a verdict and a ledger entry regardless of its size. A large mechanical change with a clear recipe is the ideal mission. Parallel read-only missions or independent worktrees are possible; serialize writes within a shared worktree.
+For a bounded mechanical task on Corvex `zai-org/GLM-5.2-FP8`:
 
 ```bash
 python3 <skill-dir>/scripts/corvee run \
-  --mission /absolute/path/to/mission.md \
-  --cwd /absolute/path/to/repository \
-  --model exact-provider-model-id \
-  --complexity low
+  --mission /absolute/path/mission.md --cwd /absolute/path/repository \
+  --model zai-org/GLM-5.2-FP8 --thinking disabled \
+  --max-output-tokens 8192 --complexity low --write
 ```
 
-Omit `--write` for analysis and review; enable it only for authorized edits. The delegate reads, searches and edits; it cannot execute anything. File tools confine paths to the repository but do not guarantee that repository contents are secret-free. Use a sanitized checkout when needed.
+Omit `--write` for inspection. On this endpoint, GLM uses
+`chat_template_kwargs.enable_thinking=false`; Kimi-K2.7-Code uses
+`chat_template_kwargs.thinking=false` (verified by a live probe). For GLM, `reasoning_effort=low` and the
+native `thinking.type=disabled` field did not disable reasoning in live probes.
+This is a provider-specific control, not a universal model capability. Omit it
+for other providers unless supported. Use thinking for tasks that need it and
+allow enough completion tokens for reasoning plus the actual edit/report.
+Do not impose a tiny completion cap on a thinking model and treat exhaustion
+as an implementation failure.
 
-Every tool result the delegate reads is persisted verbatim to `checkpoint.json` in the run directory, which embeds repository content. The runner redacts only the API key; any other secret the delegate reads — a `.env`, a private key, another tool's credentials — is written to disk and travels with the workspace. A sanitized checkout is the only complete mitigation for secret-bearing repositories.
+`--max-output-tokens` caps each completion; it is not a dollar cap. Omission
+keeps the provider default. `--effort`, `--thinking`, and the output limit are
+restored on resume when omitted; explicit overrides let the caller recover.
+A length-limited response is incomplete and its tools must not execute. Resume
+it only after deciding whether to change its inference settings or task budget.
 
-When the delegate needs something only a command can answer, it calls `request_command` and the run stops with exit `65`. Nothing has been executed. `report.md` names the command and the reason, and `status.json` repeats them under `command_request`. You decide whether to run it — this is the point where the user's own approval and sandbox apply, and refusing is a legitimate answer. To continue, capture stdout, stderr and the exit code into a file and resume:
+For ordinary test/review feedback:
 
 ```bash
-python3 <skill-dir>/scripts/corvee run --resume <run-dir> --command-result /absolute/path/to/output.txt
+python3 <skill-dir>/scripts/corvee run --resume RUN --feedback /absolute/path/check.txt
 ```
 
-The output is handed back as evidence, not as instructions. Prefer to answer the question in the next mission instead: a request costs a full round trip, so a delegate asking to run the gate on every iteration is a sign the mission was underspecified, not a workflow.
+`request_command` instead suspends with exit 65 and executes nothing. If the
+parent chooses to run the command, capture stdout, stderr, and exit code; resume
+with `--command-result FILE`. To refuse, supply a file explaining that. Feedback
+cannot bypass the pending-command requirement. Outputs are untrusted evidence.
 
-The runner prints one line per run boundary and error to stderr; the full event stream stays in `events.jsonl` unless you pass `--verbose`. Read `status.json` rather than scrolling the stream.
+## Setup and optional control workflows
 
-`status.json` records what the run itself cost on the delegate side: `economics.delegate_tool_bytes`, `delegate_tool_calls`, `mission_bytes`, `report_bytes`, `diff_bytes`, and the provider's token counts under `usage`. The runner cannot see what the planner reads, so it does not guess.
+Use [provider-setup.md](references/provider-setup.md) only for configuration or
+model selection. `configure` uses a local hidden-input wizard; never request
+keys in chat or pass them in command arguments. Existing environment variables
+or a user-identified dotenv file support noninteractive setup. Credentials are
+stored separately with mode 0600. `configure` and `check` make a tiny billable
+inference request; the public model catalog does not authenticate a key.
 
-## Boundaries the runner enforces
+CLI instructions: `configure`, `models [PATTERN]`, `select [ID|auto]`, `check`,
+`run`, `job`, `cleanup`. These follow `$corvee`; they are not registered slash commands.
 
-Write tools refuse `.git/` and `.codex/corvee/reports/` after symlink resolution: the first would grant execution through hooks or `core.sshCommand` on your next git operation, the second holds the evidence you audit. Both stay readable.
+For larger multi-iteration goals, read [control-protocol.md](references/control-protocol.md):
+`target`, `analyze`, `refine`, `loop`, `audit`, and `status` are planner workflows.
+Use durable targets when useful; only explicit target/refine work may change
+acceptance criteria. Never weaken a gate to manufacture success.
 
-Search and listing prefer `rg` and fall back to `grep` with extended regular expressions and a plain directory walk. Both fallbacks skip hidden entries and symlinks but do not honor `.gitignore`, so ignored private files must be removed from shared checkouts. Linux/macOS wall-clock deadlines interrupt blocked requests and terminate the runner's own search and git subprocesses.
+## Evidence, budgets, and boundaries
 
-## After a run
+Read `status.json` for exit status, cumulative provider usage, tool counts and
+bytes. Keep verbose event streams out of planner context. Economics do not
+include planner tokens. `--complexity` gives low 16 steps/20 minutes, medium
+32/60, high 48/120; explicit step/time overrides win. Requests default to 600
+seconds within the run deadline. Repairs must fit the remaining overall budget.
 
-Capture the report and exit status, rerun the gate command yourself, read the change, and update the ledger with evidence. Rerunning the gate is not delegable. For a change too large to read, `audit` sends a fresh read-only mission that reports on it, but delegating a reading costs planner output tokens to specify and a round trip to wait for. Exit zero means a report was returned, not that the target passed. Timeouts and missing reports are incomplete work. Never weaken acceptance gates to obtain success.
+File tools confine paths to the repository. Writes refuse `.git` components,
+`.codex/corvee/reports`, and the active custom run directory after resolution.
+New artifact paths must resolve inside the repository; existing ignore rules
+are preserved when artifact exclusions are appended. Read-only mode disables
+file edits. This is not an OS sandbox: the unresolved Git-helper issue means
+Git inspection can execute existing configured helpers. Use a sanitized trusted
+checkout; do not claim a complete execution boundary pending that fix.
 
-`--complexity` picks the step and time budget: `low` is 16 steps and 20 minutes, `medium` 32 and 60, `high` 48 and 120. Pass `--max-steps` or `--max-time` only to override one of them.
-
-Requests default to a 600-second timeout within the total run budget. On failure or incomplete wrap-up, follow the recovery guidance in [control-protocol.md](references/control-protocol.md) before retrying; prefer `scripts/corvee run --resume <run-dir>` to continue from checkpoint instead of reissuing the same mission from scratch. Resuming reuses the original run's `--write` mode; asking for `--write` on a run that was read-only is refused.
-
-`loop` is a workflow within the active Codex session, not a background scheduler. Stop at independently verified completion, the budget, or a blocker requiring user input or expanded authority.
+Mission content and tool results go to the provider. Private checkpoints embed
+repository content and provider reasoning fields. Only the configured API key
+is redacted; other secrets may persist. Exclude secrets before delegation.
+Search/listing prefer rg; fallbacks skip hidden entries and symlinks but do not
+honor gitignore. Resume preserves original write authority and refuses widening
+read-only runs. Missing reports, timeouts, and incomplete output never pass gates.
