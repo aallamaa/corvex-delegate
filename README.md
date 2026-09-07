@@ -49,6 +49,21 @@ costs: the larger queue implementation still failed this test. The migration
 trial supports cheap, decisive acceptance; the implementation and adversarial
 trials do not establish savings for open-ended correctness work.
 
+### Real repository follow-up (September 8)
+
+A real test-module refactor cost **$0.498 direct versus $0.216 for Corvée plus
+Astra acceptance**, 56.6% lower in dedicated model calls. Both final candidates
+preserved the original test-class bodies and passed all 211 tests, lint, and
+packaging. Corvée's initial attempt failed on an unused import; the accepted
+follow-up used a separately recorded deterministic Ruff fix, without another
+worker call. This was a post-hoc correction, not a successful one-shot trial.
+
+There was no separate Astra planning call. Task selection, source preparation,
+extra structural checks, and this conversation were not separately metered, so
+this does not prove lower global cost. The modest maintenance task and script
+harness also do not validate the shipped job loop unchanged. See the
+[full result and limitations](COST_ASSESSMENT.md#real-repository-refactor-pilot--2026-09-08).
+
 ## Acknowledgments
 
 Thank you to **Corvex** for generously granting me alpha access to their APIs, which made it possible to build and test this skill.
@@ -145,6 +160,12 @@ Other instructions: `check`, `refine`, `run` (one iteration), `job` (bounded aut
 Codex maintains acceptance criteria, missions, and progress in `.codex/corvee/` in the target repository. A loop ends at independently verified completion or its budget/blocking boundary. Loops run in the active Codex session, not as a background service.
 
 ## Choosing cost-effective work
+
+The default is narrow: substantial work with settled scope and existing executable
+acceptance checks. Small known fixes stay direct. Discovery, weakly tested
+implementation, and adversarial work require an explicit bounded mission or
+experiment; they are not assumed savings routes. No new real-task savings claim
+is made until a matched accepted-task trial supports it.
 
 | Work | Preferred route |
 |---|---|

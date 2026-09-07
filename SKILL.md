@@ -1,6 +1,6 @@
 ---
 name: corvee
-description: Delegate bounded repository reading, implementation, and repair to inexpensive Corvex workers while Codex owns scope and final acceptance.
+description: Delegate substantial, clearly scoped work with existing executable acceptance checks to Corvex workers; Codex owns the contract and final acceptance. Supports explicitly requested bounded discovery and outsourcing experiments.
 ---
 
 # Corvée
@@ -12,12 +12,21 @@ handing it off, then paying it again to rewrite the worker's solution.
 
 ## Choose work before paying for a handoff
 
-Use direct work for small known fixes or an already-available deterministic
-solution. Favor Corvée for substantial related work under one settled contract
-and strong executable checks. Unknown entry points call for bounded cheap
-discovery; unresolved semantics stay with Codex until acceptance is clear.
-Reuse the task and current session instead of adding a planning call. Long output
-is not value if Codex must reread and solve it to accept it.
+Use delegation by default only when scope and behavior are settled, existing
+executable checks support acceptance, and the batch is substantial enough to
+plausibly amortize instruction and verification. Prefer one coherent `job` that
+fits its source-packet limits. Keep small known fixes, existing deterministic
+solutions, and work requiring Codex to solve it before delegation direct.
+
+Reuse the task and current session; do not add a separate planning model call
+when the contract is already clear. A worker's self-review cannot replace checks
+for requirements the gate does not cover. Count all attempts and any Codex repair
+against delegation cost. An incomplete result never establishes savings.
+
+Use discovery, weakly tested implementation, and adversarial work as explicitly
+requested bounded missions or experiments, not automatic cost-saving routes.
+Respect the user's delegation/model requirements. If there is no suitable real
+task, request one instead of manufacturing a benchmark or launching paid retries.
 Read [work-routing.md](references/work-routing.md) when selecting a package,
 budgeting a handoff, or deciding how much final review is necessary.
 

@@ -631,3 +631,69 @@ promote it on an assumed saving, automatically raise its budget, or remove faile
 attempts from accounting. Any next adversarial trial should first constrain the
 search breadth and require a small executable deliverable within the reasoning
 budget; that remains an unmeasured proposed change.
+
+
+## Real repository refactor pilot — 2026-09-08
+
+A bounded maintenance experiment used the actual Corvee repository at commit
+`210b7f8` (with current documentation edits copied into isolated fixtures).
+Move three existing Git/accounting test classes from the large test module to
+`tests/test_corvee_git.py`, preserving every class body, and update the package
+manifest. Both arms received the same task and source excerpts and submitted a
+migration script. The source checkout was not refactored by this experiment.
+This is a modest real maintenance task selected for the evaluation, not a large
+production feature or an independently requested backlog change.
+
+| Arm / phase | Dedicated model cost | Outcome |
+|---|---:|---|
+| Direct Astra low | $0.498028 | Accepted |
+| Kimi-K2.7-Code thinking, one call | $0.041489 | Tests and structural checks passed; initial lint failed |
+| Astra acceptance after deterministic cleanup | $0.174900 | Accepted |
+| Delegated follow-up total | $0.216389 | 56.6% lower dedicated model cost than direct |
+
+**Original one-attempt result: delegated failure.** Corvee added one unused import.
+A separately labeled, post-hoc follow-up ran Ruff's F401 fix on the new test file;
+its exact diff was checked to remove only that import. It made no additional
+worker call and did not weaken the gate. Astra accepted the corrected evidence.
+This is an exploratory result for a workflow with deterministic cleanup, not a
+predeclared successful one-shot trial. No paid worker retries or model sweep ran.
+
+Acceptance checked unchanged ASTs for every original test class, exactly the
+three requested moved classes, only the three permitted changed paths, all 211
+tests passing without a discovery-count change, Ruff, and packaging. The test
+suite starts localhost mock HTTP servers: the initial network-disabled command
+sandbox blocked nine tests in both arms. Those infrastructure failures are
+archived. Both arms were checked with network enabled for the test process in
+Codex's workspace-write executor; other commands retained network-disabled
+execution. No additional model calls were needed for that environment correction.
+The network-enabled policy allows more than loopback; it is not a loopback-only
+sandbox or a changed default in the shipped executor.
+
+There was no separate Astra planning call: the existing task and selected source
+packet were reused. Astra direct used 194,800 input tokens (171,008 cached) and
+1,782 output tokens. Worker usage was 3,459 input and 17,994 output, including
+16,820 reasoning tokens. Acceptance used 17,205 uncached input and 57 output.
+All reported output is counted once. Model-phase time was 96.0 seconds direct
+versus 257.9 seconds delegated (249.8 worker + 8.1 acceptance), plus external
+validation and dispatch gaps. Dedicated experiment calls totaled $0.714417.
+
+Rates were refreshed from the [official Astra model page](https://developers.openai.com/api/docs/models/gpt-6-astra)
+and the Corvex catalog: Astra $10/$1/$12.50/$50 per million input/cache-read/
+cache-write/output tokens; Kimi $0.55/$2.20 input/output (catalog provisional).
+These are API-equivalent estimates, not subscription-credit measurements.
+**Root task selection, source extraction, added structural gate construction,
+orchestration conversation, cleanup adjudication, and reporting were not separately
+metered.** The dedicated-call saving does not establish lower total global cost.
+Production delegation would have to include any such task-specific preparation.
+
+The script/probe harness differs from shipped `corvee job`: one cheap generation
+call, no separate cheap review, deterministic execution, then Astra acceptance.
+One pair plus a post-hoc correction gives no variance or reliability estimate.
+Evidence is retained locally under `.codex/bench/real-refactor-20260908/`, including
+original and corrected outcomes, prompts, responses, usage, script, structural
+checks, test logs, final artifacts, pricing catalog and `result.json`.
+
+**Practical finding:** ordinary deterministic cleanup can avoid buying another
+reasoning call for a mechanical lint failure. In future authorized trials, declare
+such scope-limited cleanup before execution and recheck the exact candidate.
+This follow-up supports that experiment; it does not prove broad cost efficiency.

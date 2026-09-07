@@ -5,6 +5,19 @@ informed by the [measured trials](../COST_ASSESSMENT.md), not a proven optimum.
 The successful synthetic migration cost $0.190 versus $0.452 direct; a larger
 implementation was more expensive and incorrect. Size alone is not a selector.
 
+## Default admission
+
+Before ordinary delegation, identify the actual outcome, bounded editable scope,
+existing acceptance checks, and why execution is likely to outweigh coordination.
+These are dispatch facts, not a new planner report. If a fact is missing, keep
+work direct or resolve it through an explicitly requested bounded discovery or
+experiment. Do not manufacture extra work to make a small task look delegatable.
+
+Use one fixed attempt budget. Reaching it does not authorize another model sweep,
+a larger cap, or an Astra rewrite. Preserve the failed cost and present the
+specific remaining decision. If no representative real task is available, ask
+for one and defer paid comparison rather than repeating synthetic evidence.
+
 ## Choose the lane before preparing a detailed mission
 
 | Situation | Route | Acceptance |
@@ -103,3 +116,13 @@ itself creates no model turn, while dispatching/reporting through Codex chat
 still consumes tokens. Its sandbox constrains execution; it does not make every
 repository command harmless or authorized. Non-Git file tools and provider calls
 remain outside that sandbox.
+
+## Deterministic cleanup before another reasoning call
+
+The real refactor pilot initially failed lint on one unused import. A post-hoc
+Ruff fix and fresh verification produced an accepted result without another
+worker call. For a future task, consider declaring a standard formatter or narrow
+lint autofix in the authorized workflow up front. Confine it to editable files,
+check its actual diff, and rerun affected acceptance checks. Do not alter tests,
+contracts, or lint configuration to make a candidate pass. This is an exploratory
+workflow improvement; the pilot excluded task-preparation and root-review cost.
