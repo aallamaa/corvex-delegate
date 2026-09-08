@@ -39,7 +39,9 @@ def make_provider(scripted):
 class Tmp:
     def __init__(self):
         self.d = tempfile.TemporaryDirectory()
-        self.root = Path(self.d.name)
+        # Provider edits must echo the canonical paths sent in source packets.
+        # macOS temporary paths commonly enter through /var -> /private/var.
+        self.root = Path(self.d.name).resolve()
 
     def write(self, name, body):
         p = self.root / name
@@ -68,6 +70,30 @@ class TestCorveeJob(unittest.TestCase):
             call=call,
             **kw,
         )
+
+    def test_temporary_directory_alias_uses_canonical_provider_paths(self):
+        from unittest.mock import patch
+
+        real = self.tmp.root / "real-temp"
+        real.mkdir()
+        alias = self.tmp.root / "temp-alias"
+        alias.symlink_to(real, target_is_directory=True)
+        with patch.object(tempfile, "tempdir", str(alias)):
+            fixture = Tmp()
+        self.addCleanup(fixture.d.cleanup)
+        self.assertEqual(fixture.root, fixture.root.resolve())
+        src = fixture.write("app.py", "value = 1\n")
+        job = cj.Job(
+            cwd=alias / fixture.root.name, mission="set value to 2", model="m",
+            scope=["app.py"], protected=[], gate_argv=[sys.executable, "-c", "pass"],
+            call=make_provider([
+                impl_resp({"edits": [{"path": str(src), "old": "value = 1", "new": "value = 2"}]}),
+                rev_resp(True),
+            ]),
+        )
+        result = job.run()
+        self.assertEqual(result["status"], "ready", result["reason"])
+        self.assertEqual(src.read_text(), "value = 2\n")
 
     def test_success(self):
         prov = make_provider([
